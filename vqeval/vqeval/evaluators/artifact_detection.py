@@ -142,54 +142,56 @@ class ArtifactDetectionEvaluator(BaseEvaluator):
             # mediapipe not installed, or newer version without solutions API
             return 0, []
 
-        error_count = 0
-        error_frames = []
-        n = len(frames_rgb)
+        try:
+            error_count = 0
+            error_frames = []
+            n = len(frames_rgb)
 
-        # Track hand landmark counts across frames for consistency
-        hand_counts_per_frame = []
+            # Track hand landmark counts across frames for consistency
+            hand_counts_per_frame = []
 
-        step = max(1, n // 15)  # Sample up to ~15 frames
-        for i in range(0, n, step):
-            frame = frames_rgb[i]
-            frame_errors = []
+            step = max(1, n // 15)  # Sample up to ~15 frames
+            for i in range(0, n, step):
+                frame = frames_rgb[i]
+                frame_errors = []
 
-            # Hand analysis
-            hand_result = hands.process(frame)
-            if hand_result.multi_hand_landmarks:
-                for hand_landmarks in hand_result.multi_hand_landmarks:
-                    # Check for impossible finger configurations
-                    finger_issues = self._check_finger_geometry(hand_landmarks)
-                    if finger_issues:
-                        frame_errors.extend(finger_issues)
+                # Hand analysis
+                hand_result = hands.process(frame)
+                if hand_result.multi_hand_landmarks:
+                    for hand_landmarks in hand_result.multi_hand_landmarks:
+                        # Check for impossible finger configurations
+                        finger_issues = self._check_finger_geometry(hand_landmarks)
+                        if finger_issues:
+                            frame_errors.extend(finger_issues)
 
-                hand_counts_per_frame.append(len(hand_result.multi_hand_landmarks))
-            else:
-                hand_counts_per_frame.append(0)
+                    hand_counts_per_frame.append(len(hand_result.multi_hand_landmarks))
+                else:
+                    hand_counts_per_frame.append(0)
 
-            # Pose analysis
-            pose_result = pose.process(frame)
-            if pose_result.pose_landmarks:
-                limb_issues = self._check_limb_symmetry(pose_result.pose_landmarks)
-                if limb_issues:
-                    frame_errors.extend(limb_issues)
+                # Pose analysis
+                pose_result = pose.process(frame)
+                if pose_result.pose_landmarks:
+                    limb_issues = self._check_limb_symmetry(pose_result.pose_landmarks)
+                    if limb_issues:
+                        frame_errors.extend(limb_issues)
 
-            if frame_errors:
-                error_count += len(frame_errors)
-                orig_idx = int(i)  # Simplified; would use video.frame_indices
-                error_frames.append([orig_idx, orig_idx + step])
+                if frame_errors:
+                    error_count += len(frame_errors)
+                    orig_idx = int(i)  # Simplified; would use video.frame_indices
+                    error_frames.append([orig_idx, orig_idx + step])
 
-        # Check for sudden appearance/disappearance of hands
-        if len(hand_counts_per_frame) > 2:
-            diffs = np.diff(hand_counts_per_frame)
-            sudden_changes = int(np.sum(np.abs(diffs) > 0))
-            if sudden_changes > len(hand_counts_per_frame) // 3:
-                error_count += sudden_changes
+            # Check for sudden appearance/disappearance of hands
+            if len(hand_counts_per_frame) > 2:
+                diffs = np.diff(hand_counts_per_frame)
+                sudden_changes = int(np.sum(np.abs(diffs) > 0))
+                if sudden_changes > len(hand_counts_per_frame) // 3:
+                    error_count += sudden_changes
 
-        hands.close()
-        pose.close()
-
-        return error_count, error_frames
+            return error_count, error_frames
+        finally:
+            # Always release MediaPipe graph resources, even on exception.
+            hands.close()
+            pose.close()
 
     def _check_finger_geometry(self, hand_landmarks) -> list[str]:
         """Check for impossible finger joint configurations."""

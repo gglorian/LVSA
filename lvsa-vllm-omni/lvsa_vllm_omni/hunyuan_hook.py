@@ -24,6 +24,7 @@ from lvsa.sparse_attention import (
 )
 
 from .config import LVSAConfig
+from .global_kv import build_global_kv
 
 
 def _mask_log_should_fire(spec: str, step_idx: int, last_step: int) -> bool:
@@ -181,19 +182,6 @@ class HunyuanLVSAState:
         return self._metadata
 
 
-def _build_global_kv(
-    key: torch.Tensor, value: torch.Tensor, global_indices: list, num_patches: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract K/V for global frames."""
-    P = num_patches
-    token_indices = []
-    for gf in global_indices:
-        start = gf * P
-        token_indices.extend(range(start, start + P))
-    idx = torch.tensor(token_indices, dtype=torch.long, device=key.device)
-    return key[:, idx], value[:, idx]
-
-
 def install_hunyuan_lvsa_hook(total_latent_frames: int) -> None:
     """Monkey-patch HunyuanVideo15Attention.forward to use LVSA.
 
@@ -267,7 +255,26 @@ def install_hunyuan_lvsa_hook(total_latent_frames: int) -> None:
                 extra={"step": step_idx},
             )
 
-        if encoder_hidden_states is not None:
+        # ── Distributed CP guard ──
+        # Under Ulysses / Ring SP, ``video_seq`` is the per-rank shard, not the
+        # full T_lat × P. Geometry detection would silently corrupt the
+        # attention pattern. Fall back to dense in that case.
+        try:
+            import torch.distributed as _dist
+            _is_distributed = _dist.is_initialized() and _dist.get_world_size() > 1
+        except Exception:
+            _is_distributed = False
+        if _is_distributed and encoder_hidden_states is not None:
+            from ._fallback import warn_fallback
+            warn_fallback(
+                origin="hunyuan_hook",
+                reason="distributed_cp",
+                seq_len=query.shape[1],
+                extra={"step": step_idx,
+                       "world_size": _dist.get_world_size()},
+            )
+
+        if encoder_hidden_states is not None and not _is_distributed:
             # ── LVSA path: sparse on video, dense on encoder ──
             B, video_seq, H, D = query.shape
             P = video_seq // total_latent_frames
@@ -294,7 +301,7 @@ def install_hunyuan_lvsa_hook(total_latent_frames: int) -> None:
                 )
 
             # Build global K/V from video + append encoder K/V
-            k_global, v_global = _build_global_kv(key, value, metadata.global_indices, P)
+            k_global, v_global = build_global_kv(key, value, metadata.global_indices, P)
             k_global = torch.cat([k_global, encoder_key], dim=1)
             v_global = torch.cat([v_global, encoder_value], dim=1)
 

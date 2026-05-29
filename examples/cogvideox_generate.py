@@ -40,7 +40,12 @@ from diffusers import CogVideoXPipeline
 from diffusers.utils import export_to_video
 
 from lvsa.adapters.cogvideox import CogVideoXAdapter
-from lvsa.device import get_device, max_memory_allocated, mem_get_info
+from lvsa.device import (
+    get_device,
+    get_distributed_backend,
+    max_memory_allocated,
+    mem_get_info,
+)
 from lvsa.parallel import (
     patch_rotary_emb_for_context_parallel,
     install_lvsa_processors,
@@ -148,7 +153,7 @@ def main() -> None:
     # ── Distributed vs single-GPU detection ────────────────────────────────────
     distributed = "RANK" in os.environ
     if distributed:
-        dist.init_process_group("nccl")
+        dist.init_process_group(get_distributed_backend())
         rank = dist.get_rank()
         world = dist.get_world_size()
     else:

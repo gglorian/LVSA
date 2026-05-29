@@ -26,7 +26,8 @@ from ._fallback import warn_fallback
 
 
 # Reuse HunyuanLVSAState — it is model-agnostic (step tracking, metadata cache).
-from .hunyuan_hook import HunyuanLVSAState, _build_global_kv, _mask_log_should_fire
+from .hunyuan_hook import HunyuanLVSAState, _mask_log_should_fire
+from .global_kv import build_global_kv
 
 
 def install_wan_lvsa_hook(total_latent_frames: int) -> None:
@@ -79,11 +80,24 @@ def install_wan_lvsa_hook(total_latent_frames: int) -> None:
         # ── Step tracking ──
         step_idx = state.tick(id(self), local_seq)
 
+        # ── Distributed CP guard ──
+        # Under Ulysses / Ring SP, the sequence dimension is sharded across
+        # ranks before this forward runs. ``local_seq`` no longer equals the
+        # full T_lat × P, so the LVSA geometry detection would silently match
+        # the wrong P. Fall back to dense — a per-rank LVSA pattern is not
+        # supported in this release.
+        try:
+            import torch.distributed as _dist
+            _is_distributed = _dist.is_initialized() and _dist.get_world_size() > 1
+        except Exception:
+            _is_distributed = False
+
         # ── Geometry check ──
         # full_seq must equal T_lat * P (no encoder tokens in Wan self-attn).
         geometry_ok = (
             total_latent_frames > 0
             and full_seq % total_latent_frames == 0
+            and not _is_distributed
         )
         P = full_seq // total_latent_frames if geometry_ok else -1
 
@@ -110,7 +124,7 @@ def install_wan_lvsa_hook(total_latent_frames: int) -> None:
                     expand_window=metadata.expand_window,
                 )
 
-            k_global, v_global = _build_global_kv(
+            k_global, v_global = build_global_kv(
                 key, value, metadata.global_indices, P,
             )
             out_local = lvsa_sdpa(
@@ -126,9 +140,10 @@ def install_wan_lvsa_hook(total_latent_frames: int) -> None:
         if not geometry_ok:
             warn_fallback(
                 origin="wan_hook",
-                reason="geometry_mismatch",
+                reason="distributed_cp" if _is_distributed else "geometry_mismatch",
                 seq_len=local_seq,
-                extra={"T_lat": total_latent_frames, "full_seq": full_seq},
+                extra={"T_lat": total_latent_frames, "full_seq": full_seq,
+                       "distributed": _is_distributed},
             )
 
         # Fall back to original forward (dense attention via self.attn)

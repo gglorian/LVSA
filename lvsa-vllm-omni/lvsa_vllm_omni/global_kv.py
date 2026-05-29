@@ -32,13 +32,11 @@ def build_global_kv(
         return key.new_empty(B, 0, H, D), value.new_empty(B, 0, H, D)
 
     P = num_patches
-    # Build flat token index: [gi*P, gi*P+1, ..., gi*P+P-1] for each global frame
-    token_indices = []
-    for gf in global_indices:
-        start = gf * P
-        token_indices.extend(range(start, start + P))
-
-    idx = torch.tensor(token_indices, dtype=torch.long, device=key.device)
+    device = key.device
+    # Vectorized: gi*P, gi*P+1, ..., gi*P+P-1 for each gi, all on-device.
+    g = torch.as_tensor(global_indices, dtype=torch.long, device=device)
+    offsets = torch.arange(P, dtype=torch.long, device=device)
+    idx = (g.unsqueeze(1) * P + offsets.unsqueeze(0)).flatten()
     k_global = key[:, idx]   # [B, num_global*P, H, D]
     v_global = value[:, idx]  # [B, num_global*P, H, D]
     return k_global, v_global

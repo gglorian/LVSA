@@ -2,7 +2,7 @@
 
 The actual ``install_hunyuan_lvsa_hook`` requires vllm-omni installed, so we
 focus on:
-  - The module-level helpers (``_mask_log_should_fire``, ``_build_global_kv``)
+  - The module-level helpers (``_mask_log_should_fire``, ``build_global_kv``)
     which are pure and CPU-testable.
   - The ``HunyuanLVSAState`` class (step tracking, metadata caching).
   - Graceful gating via ``maybe_install_hunyuan_hook`` (register.py path).
@@ -18,10 +18,10 @@ import pytest
 import torch
 
 from lvsa_vllm_omni.hunyuan_hook import (
-    _build_global_kv,
     _mask_log_should_fire,
     HunyuanLVSAState,
 )
+from lvsa_vllm_omni.global_kv import build_global_kv
 from lvsa_vllm_omni.config import LVSAConfig
 
 
@@ -76,7 +76,7 @@ class TestMaskLogShouldFire:
         assert _mask_log_should_fire("3-abc", 5, -1) is False
 
 
-# ── _build_global_kv (pure tensor function) ──────────────────────────────────
+# ── build_global_kv (pure tensor function) ──────────────────────────────────
 
 
 class TestBuildGlobalKV:
@@ -86,7 +86,7 @@ class TestBuildGlobalKV:
         k = torch.randn(B, seq, H, D)
         v = torch.randn(B, seq, H, D)
         global_indices = [0, 2, 5]
-        k_g, v_g = _build_global_kv(k, v, global_indices, P)
+        k_g, v_g = build_global_kv(k, v, global_indices, P)
         assert k_g.shape == (B, len(global_indices) * P, H, D)
         assert v_g.shape == (B, len(global_indices) * P, H, D)
 
@@ -97,7 +97,7 @@ class TestBuildGlobalKV:
         k = torch.randn(B, seq, H, D)
         v = torch.randn(B, seq, H, D)
         global_indices = [1, 3]   # tokens 2,3 and 6,7
-        k_g, v_g = _build_global_kv(k, v, global_indices, P)
+        k_g, v_g = build_global_kv(k, v, global_indices, P)
         expected_token_ids = [2, 3, 6, 7]
         for i, tid in enumerate(expected_token_ids):
             assert torch.equal(k_g[0, i], k[0, tid])
@@ -107,7 +107,7 @@ class TestBuildGlobalKV:
         B, T, P, H, D = 1, 4, 2, 1, 4
         k = torch.randn(B, T * P, H, D)
         v = torch.randn(B, T * P, H, D)
-        k_g, v_g = _build_global_kv(k, v, [], P)
+        k_g, v_g = build_global_kv(k, v, [], P)
         assert k_g.shape == (B, 0, H, D)
         assert v_g.shape == (B, 0, H, D)
 
@@ -115,7 +115,7 @@ class TestBuildGlobalKV:
         B, T, P, H, D = 3, 4, 2, 2, 8
         k = torch.randn(B, T * P, H, D)
         v = torch.randn(B, T * P, H, D)
-        k_g, v_g = _build_global_kv(k, v, [0, 2], P)
+        k_g, v_g = build_global_kv(k, v, [0, 2], P)
         assert k_g.shape == (B, 2 * P, H, D)
         # Per-batch slicing preserved
         assert torch.equal(k_g[1], k[1, [0, 1, 4, 5]])
