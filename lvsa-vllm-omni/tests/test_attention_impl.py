@@ -188,3 +188,37 @@ class TestStepTracker:
         step_tracker.reset()
         assert step_tracker.get_step() == 0
         assert step_tracker.get_total_latent_frames() is None
+
+
+class TestStepCounterCFGParallel:
+    """Under CFG-parallel the cond/uncond passes run on DIFFERENT ranks, so each
+    rank sees n_blocks * (cfg_passes / cfg_world) calls per denoising step. The
+    hardcoded cfg_passes=2 made the counter advance at half rate under
+    cfg_parallel_size=2 — breaking [LVSA-TIME] emission AND halving the
+    --rotate-keyframes rotation rate (set_step drives rotation)."""
+
+    def _make_counter(self, monkeypatch, cfg_world):
+        monkeypatch.setenv("LVSA_N_BLOCKS", "3")
+        import lvsa_vllm_omni.attention_impl as ai
+        monkeypatch.setattr(ai, "cfg_parallel_world_size", lambda: cfg_world)
+        return ai._StepCounter()
+
+    def test_cfg_world1_step_advances_every_nblocks_x2(self, monkeypatch):
+        c = self._make_counter(monkeypatch, cfg_world=1)
+        # 3 blocks x 2 passes = 6 calls per step
+        steps = [c.tick(layer_id=i % 3, seq_len=100) for i in range(12)]
+        assert steps[5] == 0 and steps[6] == 1 and steps[11] == 1
+
+    def test_cfg_world2_step_advances_every_nblocks(self, monkeypatch):
+        c = self._make_counter(monkeypatch, cfg_world=2)
+        # 3 blocks x (2/2)=1 pass per rank = 3 calls per step
+        steps = [c.tick(layer_id=i % 3, seq_len=100) for i in range(9)]
+        assert steps[2] == 0 and steps[3] == 1 and steps[6] == 2
+
+    def test_cfg_world_absent_framework_defaults_to_1(self, monkeypatch):
+        # without monkeypatching, vllm-omni is absent in CPU tests -> world=1
+        monkeypatch.setenv("LVSA_N_BLOCKS", "3")
+        import lvsa_vllm_omni.attention_impl as ai
+        c = ai._StepCounter()
+        steps = [c.tick(layer_id=i % 3, seq_len=100) for i in range(7)]
+        assert steps[5] == 0 and steps[6] == 1

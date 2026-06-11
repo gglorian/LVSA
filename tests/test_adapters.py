@@ -470,3 +470,34 @@ class TestAdapterInterface:
         for method in optional:
             assert hasattr(adapter, method)
             assert callable(getattr(adapter, method))
+
+
+class TestWanCPPlan:
+    """The CP plan must split per-token timestep conditioning (Wan2.2 TI2V-5B).
+
+    TI2V's expand_timesteps mode makes `timestep` [B, seq] -> temb/timestep_proj
+    become per-token ([B, seq, 6, D] / [B, seq, D]). The entry-split shards
+    hidden_states only, so without a root-level timestep split every block's
+    `norm1(hidden) * (1 + scale_msa)` crashes with a 27280-vs-54560 mismatch
+    under torchrun CP. Mirrors diffusers-main's native Wan _cp_plan. Wan2.1's
+    1-D timestep is unaffected (expected_dims=2 -> split skipped on ndim != 2).
+    """
+
+    def test_cp_plan_splits_per_token_timestep(self):
+        from types import SimpleNamespace
+        adapter = WanAdapter()
+        captured = {}
+        transformer = SimpleNamespace(
+            enable_parallelism=lambda config: captured.setdefault("config", config),
+        )
+        adapter.setup_context_parallel(transformer, world=2)
+
+        plan = transformer._cp_plan
+        assert "" in plan, "plan must include the root module for the timestep input"
+        ts = plan[""]["timestep"]
+        assert ts.split_dim == 1
+        assert ts.expected_dims == 2          # [B, seq] (TI2V); ndim=1 (Wan2.1) skipped
+        assert ts.split_output is False
+        # existing entries must survive
+        assert plan["blocks.0"]["hidden_states"].split_dim == 1
+        assert plan["proj_out"].gather_dim == 1

@@ -26,6 +26,7 @@ from lvsa.sparse_attention import (
 )
 
 from . import step_tracker
+from ._sp import cfg_parallel_world_size
 from .config import LVSAConfig
 from .global_kv import build_global_kv
 
@@ -54,6 +55,11 @@ class _StepCounter:
         # Without CFG (guidance_scale == 1) it is 1. Default 2 matches the
         # common case (guidance > 1).
         self._cfg_passes: int = max(1, int(os.environ.get("LVSA_CFG_PASSES", 2)))
+        # Per-rank passes: under cfg_parallel_size=N the framework spreads the
+        # CFG passes across N ranks, so each rank sees cfg_passes/N forwards
+        # per step. Resolved lazily (the distributed group may not exist yet
+        # at construction time) and cached.
+        self._eff_cfg_passes: Optional[int] = None
         self._step: int = 0
         self._generation_seq_len: Optional[int] = None
         self._seen_ids: set = set()
@@ -93,10 +99,18 @@ class _StepCounter:
                 self._seen_ids.add(layer_id)
 
         # Compute step_idx from total call count. One denoising step =
-        # n_blocks * cfg_passes attention forwards (cfg_passes=2 with CFG).
+        # n_blocks * per-rank cfg passes. Under cfg_parallel_size=N the
+        # cond/uncond passes run on different ranks, so each rank only sees
+        # cfg_passes/N forwards per step — without the division the counter
+        # advances at 1/N rate (halving keyframe rotation and starving the
+        # [LVSA-TIME]/[LVSA-MEM] step logs).
         # _call_count is the running total since the last seq_len reset.
         if self._n_blocks is not None:
-            threshold = self._n_blocks * self._cfg_passes
+            if self._eff_cfg_passes is None:
+                self._eff_cfg_passes = max(
+                    1, self._cfg_passes // cfg_parallel_world_size()
+                )
+            threshold = self._n_blocks * self._eff_cfg_passes
             new_step = (self._call_count - 1) // threshold
             if new_step > self._step:
                 self._step = new_step

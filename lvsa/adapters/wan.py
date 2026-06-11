@@ -187,6 +187,21 @@ class WanAdapter(ModelAdapter):
                 gather_dim=1,
                 expected_dims=3,
             ),
+            # Wan2.2 TI2V-5B uses per-token timestep conditioning
+            # (expand_timesteps): `timestep` arrives as [B, seq], making
+            # temb/timestep_proj per-token — they must be sharded alongside
+            # hidden_states or every block's `norm1(hidden) * (1 + scale_msa)`
+            # shape-crashes under CP. Splitting the root timestep input keeps
+            # condition_embedder's outputs per-rank. Wan2.1's 1-D timestep is
+            # unaffected (expected_dims=2 → split skipped when ndim != 2).
+            # Mirrors diffusers-main's native WanTransformer3DModel._cp_plan.
+            "": {
+                "timestep": ContextParallelInput(
+                    split_dim=1,
+                    expected_dims=2,
+                    split_output=False,
+                ),
+            },
         }
         transformer.enable_parallelism(
             config=ContextParallelConfig(ulysses_degree=world),
