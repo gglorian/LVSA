@@ -18,6 +18,7 @@ import torch.distributed as dist
 from .sparse_attention import (
     LVSAMetadata,
     adaptive_window_bounds,
+    build_global_kv,
     compute_auto_kfi,
     compute_boundary_guard_frames,
     compute_global_indices,
@@ -64,6 +65,53 @@ def _expand_chunk_copies_to_indices(
     return src, dst
 
 
+def _ulysses_all_to_all(
+    x: torch.Tensor, scatter_dim: int, gather_dim: int, world: int, group=None
+) -> torch.Tensor:
+    """Ulysses all-to-all on a [B, S, H, D] tensor (inference-only, no autograd).
+
+    Gather  (scatter_dim=2, gather_dim=1): [B, S_local, H, D] -> [B, S_full, H/world, D]
+    Scatter (scatter_dim=1, gather_dim=2): [B, S_full, H/world, D] -> [B, S_local, H, D]
+    """
+    import torch.distributed as dist
+    parts = [t.contiguous() for t in x.chunk(world, dim=scatter_dim)]
+    out = [torch.empty_like(parts[0]) for _ in range(world)]
+    dist.all_to_all(out, parts, group=group)
+    return torch.cat(out, dim=gather_dim).contiguous()
+
+
+class _FIState:
+    """Mutable runtime caches for one FlashInfer block-sparse plan.
+
+    The processor keeps two independent instances: ``self._fi`` for the
+    ``custom`` per-rank metadata and ``self._ufi`` for the ``ulysses``
+    full-grid metadata. Each owns its own planned wrapper + compact/Q buffers
+    because the two metadatas have different CSRs and compact shapes. Both are
+    reset (``planned=False``, buffers dropped) whenever the pattern rebuilds
+    (e.g. rotating keyframes); the 128 MB ``workspace`` scratch is kept and
+    reused across rebuilds.
+    """
+
+    __slots__ = (
+        "wrapper", "workspace", "planned",
+        "compact_k", "compact_v", "q_pad", "enc_tokens", "N_actual",
+    )
+
+    def __init__(self) -> None:
+        self.workspace = None  # 128 MB scratch, allocated once on first plan()
+        self.reset()
+
+    def reset(self) -> None:
+        """Drop the plan + per-pattern buffers (keep the workspace scratch)."""
+        self.wrapper = None
+        self.planned = False
+        self.compact_k = None
+        self.compact_v = None
+        self.q_pad = None
+        self.enc_tokens = 0
+        self.N_actual = 0
+
+
 class DistributedLVSAProcessor:
     """
     Block-sparse attention processor combining sliding window attention (LVSA),
@@ -106,6 +154,7 @@ class DistributedLVSAProcessor:
         key_frame_interval: Optional[int],
         rank: int,
         world: int,
+        cp_mode: str = "custom",
         expand_window: bool = True,
         adapter: Optional[ModelAdapter] = None,
         sparsity_scale: float = 1.0,
@@ -117,6 +166,12 @@ class DistributedLVSAProcessor:
         self.n_first_frames = n_first_frames
         self.rank = rank
         self.world = world
+        if cp_mode not in ("custom", "ulysses"):
+            raise ValueError(
+                f"cp_mode must be 'custom' or 'ulysses', got {cp_mode!r}"
+            )
+        self._cp_mode = cp_mode
+        self._num_patches = num_patches
         self._expand_window = expand_window
         self._sparsity_scale = sparsity_scale
         self._reference_frames = reference_frames
@@ -153,6 +208,26 @@ class DistributedLVSAProcessor:
         )
         self._copy_metadata_to_self()
 
+        # Plain-Ulysses metadata: the all-to-all reconstructs the FULL frame grid
+        # on each rank (head-sharded), so the sparse pattern is the single-device
+        # one — world=1, no boundary guards. Built only when that mode is active.
+        self._ulysses_metadata = None
+        if self._cp_mode == "ulysses":
+            self._ulysses_metadata = LVSAMetadata.build(
+                total_latent_frames=total_num_latent_frames,
+                num_patches=num_patches,
+                window_size=window_size,
+                n_first_frames=n_first_frames,
+                key_frame_interval=key_frame_interval,
+                rank=0,
+                world=1,
+                expand_window=expand_window,
+                keyframe_offset=0,
+                boundary_guards=[],
+                reference_frames=reference_frames,
+                sparsity_scale=sparsity_scale,
+            )
+
         # ── Cached buffers (reused across calls, avoids repeated allocation) ──
         self._kv_buf: Optional[torch.Tensor] = None
         self._kv_reduce_work: Optional[dist.Work] = None
@@ -161,12 +236,11 @@ class DistributedLVSAProcessor:
         self._bsa_dispatch_cache: Optional[dict] = None
         self._use_flashinfer = False     # enabled only via --flashinfer flag
 
-        # ── FlashInfer block-sparse state ──
-        self._fi_wrapper = None      # flashinfer.BlockSparseAttentionWrapper
-        self._fi_planned = False     # True after plan() has been called
-        self._fi_compact_k: Optional[torch.Tensor] = None  # cached compact K buffer
-        self._fi_compact_v: Optional[torch.Tensor] = None  # cached compact V buffer
-        self._fi_q_pad: Optional[torch.Tensor] = None      # cached padded Q buffer
+        # ── FlashInfer block-sparse runtime caches ──
+        # Two independent states: custom per-rank metadata vs ulysses full-grid
+        # metadata (different CSRs + compact shapes -> separate plans/buffers).
+        self._fi = _FIState()    # custom path (self._metadata)
+        self._ufi = _FIState()   # ulysses path (self._ulysses_metadata)
 
         # Device-cached tensor refs (lazily populated)
         self._global_frame_mask_device: Optional[torch.Tensor] = None
@@ -198,6 +272,17 @@ class DistributedLVSAProcessor:
                 f"global_count={len(self._global_indices)}  "
                 f"attended_per_frame={mid_attended}/{total_num_latent_frames}"
             )
+            if self._cp_mode == "ulysses" and self._ulysses_metadata is not None:
+                # The line above reflects the per-rank "custom" metadata, which the
+                # ulysses path does NOT use. The ulysses path all-to-all gathers the
+                # FULL grid and runs the single-device pattern: fewer global anchors
+                # (no boundary guards) than custom's seam-closing inflation.
+                print(
+                    f"[LVSA] cp_mode=ulysses: runs the single-device pattern on the "
+                    f"full grid via all-to-all -> "
+                    f"global_count={len(self._ulysses_metadata.global_indices)} "
+                    f"(vs custom {len(self._global_indices)} above; no boundary guards)"
+                )
 
     def _copy_metadata_to_self(self) -> None:
         """Copy LVSAMetadata fields to self for backward compatibility.
@@ -389,6 +474,26 @@ class DistributedLVSAProcessor:
         )
         self._copy_metadata_to_self()
 
+        # Keep the plain-Ulysses metadata in lockstep with the rotated pattern.
+        # It mirrors _metadata but is always single-device (rank=0, world=1, no
+        # boundary guards), since the all-to-all reconstructs the full grid on
+        # every rank. Without this it goes stale under --rotate-keyframes.
+        if self._cp_mode == "ulysses":
+            self._ulysses_metadata = LVSAMetadata.build(
+                total_latent_frames=self.total_num_frames,
+                num_patches=self.num_patches,
+                window_size=self.window_size,
+                n_first_frames=self.n_first_frames,
+                key_frame_interval=self.key_frame_interval,
+                rank=0,
+                world=1,
+                expand_window=self._expand_window,
+                keyframe_offset=offset,
+                boundary_guards=[],
+                reference_frames=self._reference_frames,
+                sparsity_scale=self._sparsity_scale,
+            )
+
         # Force re-upload of device tensors
         self._global_frame_mask_device = None
         self._window_bounds_device = None
@@ -397,11 +502,9 @@ class DistributedLVSAProcessor:
         # Reset cached KV buffers (global count may change)
         self._kv_buf = None
 
-        # Reset FlashInfer state
-        self._fi_planned = False
-        self._fi_compact_k = None
-        self._fi_compact_v = None
-        self._fi_q_pad = None
+        # Reset FlashInfer state (both paths; keeps the workspace scratch)
+        self._fi.reset()
+        self._ufi.reset()
 
     # ── Static helpers (delegators to sparse_attention module functions) ────────
 
@@ -525,31 +628,40 @@ class DistributedLVSAProcessor:
         geometry_ok = self._geometry_matches(local_seq)
 
         if geometry_ok:
-            # ── Attention computation ────────────────────────────────────────
-            # Start global KV build — the all-reduce runs asynchronously so we
-            # can overlap communication with the encoder KV concatenation below.
-            k_global, v_global = self._build_global_kv(key, value)
+            if self._cp_mode == "ulysses":
+                # ── Plain-Ulysses CP ─────────────────────────────────────────
+                # All-to-all reconstructs the full frame grid (head-sharded) on
+                # each rank, then the single-device LVSA pattern runs and the
+                # result is scattered back. world==1 is pure single-device.
+                hidden_states = self._compute_lvsa_ulysses(
+                    query, key, value, enc_k, enc_v,
+                )
+            else:
+                # ── Custom CP (sequence-sharded, global-broadcast) ───────────
+                # Start global KV build — the all-reduce runs asynchronously so
+                # we can overlap communication with the encoder KV concat below.
+                k_global, v_global = self._build_global_kv(key, value)
 
-            # ── While the all-reduce is in flight, prepare encoder KV ────────
-            # This work is independent of the global KV buffer contents, so it
-            # can execute concurrently with the NCCL collective.
-            _enc_k_ready = enc_k
-            _enc_v_ready = enc_v
+                # ── While the all-reduce is in flight, prepare encoder KV ────
+                # This work is independent of the global KV buffer contents, so
+                # it can execute concurrently with the NCCL collective.
+                _enc_k_ready = enc_k
+                _enc_v_ready = enc_v
 
-            # ── Wait for the async all-reduce to complete ────────────────────
-            if self._kv_reduce_work is not None:
-                self._kv_reduce_work.wait()
-                self._kv_reduce_work = None
+                # ── Wait for the async all-reduce to complete ────────────────
+                if self._kv_reduce_work is not None:
+                    self._kv_reduce_work.wait()
+                    self._kv_reduce_work = None
 
-            # Dual-stream: append encoder K/V to global context so every
-            # video frame attends to all text tokens.
-            if _enc_k_ready is not None:
-                k_global = torch.cat([k_global, _enc_k_ready], dim=1)
-                v_global = torch.cat([v_global, _enc_v_ready], dim=1)
+                # Dual-stream: append encoder K/V to global context so every
+                # video frame attends to all text tokens.
+                if _enc_k_ready is not None:
+                    k_global = torch.cat([k_global, _enc_k_ready], dim=1)
+                    v_global = torch.cat([v_global, _enc_v_ready], dim=1)
 
-            hidden_states = self._compute_lvsa(
-                query, key, value, k_global, v_global, encoder_hidden_states,
-            )
+                hidden_states = self._compute_lvsa(
+                    query, key, value, k_global, v_global, encoder_hidden_states,
+                )
         else:
             # ── Dense fallback (geometry mismatch) ───────────────────────────
             # Video queries attend densely to all video (+ encoder) K/V. The
@@ -745,7 +857,10 @@ class DistributedLVSAProcessor:
         encoder_hidden_states: Optional[torch.Tensor],
     ) -> torch.Tensor:
         if self._use_flashinfer:
-            return self._compute_lvsa_flashinfer(query, key, value, k_global, v_global)
+            return self._compute_lvsa_flashinfer(
+                query, key, value, k_global, v_global,
+                self._metadata, self._fi,
+            )
         return self._compute_lvsa_sdpa(query, key, value, k_global, v_global)
 
     def _compute_lvsa_sdpa(
@@ -762,29 +877,90 @@ class DistributedLVSAProcessor:
             self._metadata, self._attention_backend,
         )
 
+    def _compute_lvsa_ulysses(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        enc_k: Optional[torch.Tensor],
+        enc_v: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Plain-Ulysses LVSA: all-to-all gather the full frame grid (head-
+        sharded), run the single-device pattern, all-to-all scatter back.
+        Inputs are the per-rank shard [B, local_seq, H, D]; returns the same.
+        world==1 skips the all-to-alls (identity) -> pure single-device.
+        """
+        H = query.shape[2]
+        if self.world > 1:
+            if H % self.world != 0:
+                raise ValueError(
+                    f"cp_mode='ulysses' needs num_heads ({H}) divisible by "
+                    f"world ({self.world}); use cp_mode='custom' for this layout."
+                )
+            query = _ulysses_all_to_all(query, 2, 1, self.world)
+            key = _ulysses_all_to_all(key, 2, 1, self.world)
+            value = _ulysses_all_to_all(value, 2, 1, self.world)
+            if enc_k is not None:
+                hl = H // self.world
+                h0 = self.rank * hl
+                enc_k = enc_k[:, :, h0:h0 + hl, :].contiguous()
+                enc_v = enc_v[:, :, h0:h0 + hl, :].contiguous()
+
+        k_global, v_global = build_global_kv(
+            key, value, self._ulysses_metadata.global_indices, self._num_patches,
+        )
+        if enc_k is not None:
+            k_global = torch.cat([k_global, enc_k], dim=1)
+            v_global = torch.cat([v_global, enc_v], dim=1)
+
+        # Same single-device pattern, either backend. FlashInfer uses the
+        # ulysses metadata's CSR + its own runtime cache (self._ufi).
+        if self._use_flashinfer:
+            out = self._compute_lvsa_flashinfer(
+                query, key, value, k_global, v_global,
+                self._ulysses_metadata, self._ufi,
+            )
+        else:
+            out = lvsa_sdpa(
+                query, key, value, k_global, v_global,
+                self._ulysses_metadata, self._attention_backend,
+            )
+
+        if self.world > 1:
+            out = _ulysses_all_to_all(out, 1, 2, self.world)
+        return out
+
     # ── FlashInfer block-sparse path ─────────────────────────────────────────
 
     def _ensure_flashinfer_planned(
-        self, query: torch.Tensor, enc_tokens: int = 0,
+        self,
+        query: torch.Tensor,
+        enc_tokens: int,
+        meta: "LVSAMetadata",
+        st: _FIState,
     ) -> None:
-        """Initialize FlashInfer wrapper and call plan().
+        """Initialize a FlashInfer wrapper and call plan() for ``meta``'s CSR.
 
-        The plan is reused across all diffusion steps as long as ``enc_tokens``
-        stays the same.  On the first call (or if encoder length changes) the
-        CSR is extended with extra block columns so every Q block also attends
-        to the encoder tokens appended to k_global by dual-stream models.
+        Parametrized by ``(meta, st)`` so the same machinery serves both the
+        ``custom`` per-rank metadata (``self._metadata`` / ``self._fi``) and the
+        ``ulysses`` full-grid metadata (``self._ulysses_metadata`` /
+        ``self._ufi``). The plan is reused across diffusion steps until the
+        pattern rebuilds (which calls ``st.reset()``, e.g. rotating keyframes).
 
         Parameters
         ----------
         enc_tokens : number of encoder tokens appended to k_global (0 for
                      single-stream models like Wan).
+        meta       : the LVSAMetadata whose CSR (fi_indptr/fi_indices/fi_M/
+                     fi_N) is planned.
+        st         : the runtime cache holder to populate.
         """
         # Gen-only CSR: the encoder/text K/V is NOT appended as block columns
         # here — it is handled as a separate dense term and combined via
         # log-sum-exp in _compute_lvsa_flashinfer (avoiding the zero-padded
         # encoder-block phantom-key bug). Replanned after a metadata rebuild
-        # (which resets self._fi_planned, e.g. rotating keyframes).
-        if self._fi_planned:
+        # (which calls st.reset(), e.g. rotating keyframes).
+        if st.planned:
             return
 
         device = query.device
@@ -792,16 +968,16 @@ class DistributedLVSAProcessor:
         D = query.shape[3]
         P = self.num_patches
 
-        indptr = self._fi_indptr.to(device)
-        indices = self._fi_indices.to(device)
+        indptr = meta.fi_indptr.to(device)
+        indices = meta.fi_indices.to(device)
 
-        # Allocate workspace (128 MB)
-        if not hasattr(self, '_fi_workspace') or self._fi_workspace is None:
-            self._fi_workspace = torch.empty(
+        # Allocate workspace (128 MB), once per state, reused across rebuilds.
+        if st.workspace is None:
+            st.workspace = torch.empty(
                 128 * 1024 * 1024, dtype=torch.uint8, device=device,
             )
 
-        self._fi_wrapper = flashinfer.BlockSparseAttentionWrapper(self._fi_workspace)
+        st.wrapper = flashinfer.BlockSparseAttentionWrapper(st.workspace)
 
         dtype_map = {
             torch.float16: "float16",
@@ -810,11 +986,11 @@ class DistributedLVSAProcessor:
         }
         q_dtype_str = dtype_map.get(query.dtype, "bfloat16")
 
-        self._fi_wrapper.plan(
+        st.wrapper.plan(
             indptr=indptr,
             indices=indices,
-            M=self._fi_M,
-            N=self._fi_N,
+            M=meta.fi_M,
+            N=meta.fi_N,
             R=P,
             C=P,
             num_qo_heads=H,
@@ -824,9 +1000,9 @@ class DistributedLVSAProcessor:
             kv_data_type=q_dtype_str,
             o_data_type=q_dtype_str,
         )
-        self._fi_planned = True
-        self._fi_enc_tokens = enc_tokens
-        self._fi_N_actual = self._fi_N
+        st.planned = True
+        st.enc_tokens = enc_tokens
+        st.N_actual = meta.fi_N
 
     def _compute_lvsa_flashinfer(
         self,
@@ -835,6 +1011,8 @@ class DistributedLVSAProcessor:
         value: torch.Tensor,
         k_global: torch.Tensor,
         v_global: torch.Tensor,
+        meta: "LVSAMetadata",
+        st: _FIState,
     ) -> torch.Tensor:
         """FlashInfer block-sparse LVSA via LSE-merge.
 
@@ -844,31 +1022,37 @@ class DistributedLVSAProcessor:
         (phantom zero keys diluting every query when the text length was not a
         multiple of P). CP-aware: under world>1 each rank merges its own Q shard
         against the replicated encoder K/V.
+
+        Parametrized by ``(meta, st)`` — the caller passes either the custom
+        per-rank pair (``self._metadata``, ``self._fi``) or the ulysses
+        full-grid pair (``self._ulysses_metadata``, ``self._ufi``). All CSR /
+        copy-list geometry is read from ``meta``; all runtime buffers live on
+        ``st``.
         """
         B, local_seq, H, D = query.shape
         P = self.num_patches
-        M = self._fi_M
+        M = meta.fi_M
 
         # ── Detect encoder tokens appended to k_global ──
-        num_global_video_tokens = len(self._global_indices) * P
+        num_global_video_tokens = len(meta.global_indices) * P
         total_global_tokens = k_global.shape[1]
         enc_tokens = total_global_tokens - num_global_video_tokens
 
-        self._ensure_flashinfer_planned(query, enc_tokens)
+        self._ensure_flashinfer_planned(query, enc_tokens, meta, st)
         # ── Gen-only compact KV buffer (encoder handled separately) ──
-        compact_N = self._fi_compact_n * P
+        compact_N = meta.fi_compact_n * P
         compact_shape = (B, compact_N, H, D)
-        if self._fi_compact_k is None or self._fi_compact_k.shape != compact_shape:
-            self._fi_compact_k = query.new_zeros(*compact_shape)
-            self._fi_compact_v = query.new_zeros(*compact_shape)
-        ck, cv = self._fi_compact_k, self._fi_compact_v
+        if st.compact_k is None or st.compact_k.shape != compact_shape:
+            st.compact_k = query.new_zeros(*compact_shape)
+            st.compact_v = query.new_zeros(*compact_shape)
+        ck, cv = st.compact_k, st.compact_v
 
         # Video globals → compact positions (from pre-computed copy list)
-        for src_s, dst_s in self._fi_global_copies:
+        for src_s, dst_s in meta.fi_global_copies:
             ck[:, dst_s:dst_s + P] = k_global[:, src_s:src_s + P]
             cv[:, dst_s:dst_s + P] = v_global[:, src_s:src_s + P]
         # Local (non-global) video frames → compact positions
-        for src_s, dst_s in self._fi_local_copies:
+        for src_s, dst_s in meta.fi_local_copies:
             ck[:, dst_s:dst_s + P] = key[:, src_s:src_s + P]
             cv[:, dst_s:dst_s + P] = value[:, src_s:src_s + P]
 
@@ -878,10 +1062,10 @@ class DistributedLVSAProcessor:
 
         # ── Pad Q to M = MB * P if needed (cached, tail stays zero) ──
         if local_seq < M:
-            if self._fi_q_pad is None or self._fi_q_pad.shape != (B, M, H, D):
-                self._fi_q_pad = query.new_zeros(B, M, H, D)
-            self._fi_q_pad[:, :local_seq] = query
-            q_padded = self._fi_q_pad
+            if st.q_pad is None or st.q_pad.shape != (B, M, H, D):
+                st.q_pad = query.new_zeros(B, M, H, D)
+            st.q_pad[:, :local_seq] = query
+            q_padded = st.q_pad
         else:
             q_padded = query
 
@@ -892,7 +1076,7 @@ class DistributedLVSAProcessor:
         #    length was not a multiple of P).
         out = query.new_empty(B, local_seq, H, D)
         for b in range(B):
-            o_gen, lse_gen = self._fi_wrapper.run(
+            o_gen, lse_gen = st.wrapper.run(
                 q_padded[b], ck[b], cv[b], return_lse=True,
             )
             o_gen = o_gen[:local_seq].float()

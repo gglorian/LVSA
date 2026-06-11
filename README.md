@@ -123,6 +123,7 @@ For the algorithmic details, see [`docs/architecture.md`](docs/architecture.md).
 | [`docs/tuning.md`](docs/tuning.md) | `sparsity_scale`, `reference_latent_frames`, picking knobs for your model |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | Silent fallbacks, OOM, output-path bugs, common gotchas |
 | [`docs/architecture.md`](docs/architecture.md) | Adapter pattern, how to add a new model |
+| [`docs/parallelism.md`](docs/parallelism.md) | Multi-GPU support matrix (TP / CFG / DP / PP / HSDP / Ulysses / Ring) for plugin + standalone, with verification status |
 | [`docs/VLLM_OMNI_INTEGRATION.md`](docs/VLLM_OMNI_INTEGRATION.md) | How the vllm-omni plugin is wired |
 | [`lvsa-vllm-omni/README.md`](lvsa-vllm-omni/README.md) | Plugin reference: env vars, configuration, distributed serving |
 | [`benchmarks/README.md`](benchmarks/README.md) | Reproduce the headline numbers |

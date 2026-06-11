@@ -159,17 +159,27 @@ If you see `[LVSA-FALLBACK] origin=forward_cuda reason=geometry_detect ...`, the
 
 ## Multi-GPU
 
-Standard Ulysses context parallel. Set `--ulysses-degree N` in the vllm-omni CLI; the plugin handles the global K/V gather automatically.
+LVSA's frame-grid geometry needs the **full sequence** at the attention call, so the multi-GPU axis matters:
+
+| Axis | What it shards | LVSA |
+|---|---|---|
+| **Tensor-parallel** (`tensor_parallel_size=N`) | model weights + heads; **full sequence per rank** | **engages** — fits bigger models (Wan 2.2 14B/A14B) on N GPUs *and* keeps LVSA sparse |
+| **Ulysses / Ring SP** (`ulysses_degree` / `ring_degree`) | the **sequence** (frame grid) | **falls back to dense** (`reason=sequence_parallel`) — the per-rank tensor is a fragment of `T_lat × P`; SP-native LVSA is future work |
+| CFG-parallel / DP / PP / HSDP | batch / CFG branches / layers / weights | transparent to LVSA (full seq + heads at attention) |
+
+**Tensor-parallel is the supported path for big models.** Verified: Wan2.1-14B at `tensor_parallel_size=2` engages sparse LVSA (21/41 attended) and generates correctly — TP shards weights+heads while each rank keeps the full frame grid (LVSA's mask is head-independent; `lvsa_sdpa`/FlashInfer handle the per-rank head count; `to_out` RowParallel reduces across ranks). The hooks gate on `forward_context.sp_active` (not total `world_size`), so **pure TP engages** and **SP falls back**.
 
 ```bash
-LVSA_HUNYUAN_HOOK=1 \
-LVSA_REFERENCE_LATENT_FRAMES=33 \
-LVSA_AUTO_KEYFRAMES=1 \
-vllm serve --omni --model HunyuanVideo-1.5 --ulysses-degree 2 \
-  --diffusion-attention-config '{"per_role": {"self": {"backend": "LVSA"}}}'
+# Offline, Wan 2.2 A14B on 4 GPUs via tensor-parallel (LVSA backend path):
+.venv-vllm-main/bin/python lvsa-vllm-omni/examples/offline_lvsa.py \
+    --family wan --model /models/Wan2.2-T2V-A14B-Diffusers \
+    --tp 4 --backend flashinfer --num-frames 161 --steps 40 \
+    --prompt "..." --output-name wan_a14b_tp4
 ```
 
-**Constraint**: `seq_len = T_lat × patches_per_frame` must be divisible by `N`.
+`offline_lvsa.py` exposes `--tp` (tensor_parallel_size) and `--ulysses` (ulysses_degree). Under `--ulysses N>1` the hooks fall back to dense by design. Wan/HunyuanVideo run through the LVSA **backend** by default (no hook); set `LVSA_WAN_HOOK=1` only if you specifically need the monkey-patch path — both engage under TP.
+
+**Constraint**: `seq_len = T_lat × patches_per_frame` must be divisible by the SP degree (when using Ulysses/Ring).
 
 ## Plugin structure
 

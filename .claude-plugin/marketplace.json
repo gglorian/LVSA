@@ -31,8 +31,8 @@
     {
       "name": "lvsa-vllm-omni",
       "source": "./skills/lvsa-vllm-omni",
-      "description": "Configure and run the LVSA vllm-omni plugin: env vars, geometry overrides, hooks for Wan vs HunyuanVideo, Cosmos 3.0 (offline + cross-attention hook; points to the standalone path too), multi-GPU Ulysses.",
-      "version": "1.4.0"
+      "description": "Configure and run the LVSA vllm-omni plugin: env vars, geometry overrides, hooks for Wan vs HunyuanVideo, Cosmos 3.0 (offline + cross-attention hook; points to the standalone path too), multi-GPU (tensor-parallel engages LVSA for big models; Ulysses/Ring SP falls back to dense).",
+      "version": "1.5.0"
     },
     {
       "name": "lvsa-reproduce-paper",
