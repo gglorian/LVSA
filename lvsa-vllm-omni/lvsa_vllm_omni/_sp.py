@@ -36,3 +36,26 @@ def is_sp_active() -> bool:
         return bool(get_forward_context().sp_active)
     except Exception:
         return False
+
+
+def cfg_parallel_world_size() -> int:
+    """CFG-parallel world size (1 when inactive or vllm-omni is absent).
+
+    Under ``cfg_parallel_size=N`` the framework distributes the CFG passes
+    (cond/uncond) across N ranks, so each rank sees ``cfg_passes / N`` forward
+    passes per denoising step. The step counters divide by this so step
+    detection (and with it ``--rotate-keyframes`` rotation and ``[LVSA-TIME]``)
+    stays correct under CFG-parallel. Defensive like ``is_sp_active``: returns
+    1 when the framework or the distributed group is unavailable (CPU tests,
+    single-GPU, pre-init warmup).
+    """
+    try:
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_classifier_free_guidance_world_size,
+        )
+    except Exception:
+        return 1
+    try:
+        return max(1, int(get_classifier_free_guidance_world_size()))
+    except Exception:
+        return 1

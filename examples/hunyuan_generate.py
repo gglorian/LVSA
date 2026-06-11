@@ -137,6 +137,14 @@ def parse_args() -> argparse.Namespace:
     lvsa.add_argument("--show-mask", action="store_true", help="Print attention mask.")
     lvsa.add_argument("--show-mask-compact", nargs="?", const="once", default=None, choices=["once", "step"])
     lvsa.add_argument("--rotate-keyframes", action="store_true", help="Rotate keyframes each step.")
+    lvsa.add_argument(
+        "--cp-mode", choices=["custom", "ulysses"], default="custom",
+        help="Context-parallel attention mode (multi-GPU only). 'custom' (default) = "
+             "all_reduce of global K/V + boundary guards (no head-count constraint). "
+             "'ulysses' = all-to-all gather the full sequence, run the single-device "
+             "LVSA pattern (needs num_heads %% world == 0; HunyuanVideo 1.5 has 16 "
+             "heads -> world must divide 16).",
+    )
 
     # ── Profiling ─────────────────────────────────────────────────────────────
     parser.add_argument("--profile", action="store_true", help="Log per-step timing.")

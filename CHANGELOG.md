@@ -4,6 +4,23 @@ All notable changes to LVSA will be documented in this file. Format: [Keep a Cha
 
 ## [Unreleased]
 
+### Fixed
+
+- **Wan2.2-TI2V-5B standalone context-parallel crash.** TI2V's per-token
+  timestep conditioning (`expand_timesteps`: `timestep` is `[B, seq]`, so
+  `temb`/`timestep_proj` are per-token) was not sharded by the CP entry-split,
+  crashing every block's `norm1(hidden) * (1 + scale_msa)` with a
+  shard-vs-full-seq mismatch under `torchrun`. The Wan adapter's `_cp_plan` now
+  also splits the root `timestep` input (`expected_dims=2` — Wan 2.1's 1-D
+  timestep is unaffected), mirroring diffusers-main's native Wan plan.
+- **Plugin step counter under CFG-parallel.** Both step counters (backend
+  `_StepCounter` and hook `HunyuanLVSAState`, shared by the Cosmos hook)
+  assumed all CFG passes run on every rank; under `cfg_parallel_size=N` the
+  passes are spread across N ranks, so the counter advanced at 1/N rate —
+  halving `--rotate-keyframes` rotation and starving the `[LVSA-TIME]` /
+  `[LVSA-MEM]` per-step logs. Per-rank passes are now derived via the new
+  `_sp.cfg_parallel_world_size()`.
+
 ### Added
 
 - **Batched-input guard on `Cosmos3LVSAAttnProcessor`** (PR #5 review follow-up).
@@ -19,6 +36,11 @@ All notable changes to LVSA will be documented in this file. Format: [Keep a Cha
   `gen_seq` length ≠ `T_lat * P`. Also: `install_cosmos3_lvsa` asserts it
   patched ≥1 layer (catches a renamed/empty `transformer.layers`), and a
   non-round-resolution geometry test locks the `ceil()` patch-count behavior.
+
+- **`--cp-mode {custom,ulysses}` on `examples/hunyuan_generate.py`** — exposes
+  the standalone plain-Ulysses CP mode for HunyuanVideo (previously Wan-only;
+  the processor already supported it). HunyuanVideo 1.5 has 16 heads, so
+  `ulysses` needs `world ∈ {1, 2, 4, 8, 16}`.
 
 - **Standalone Cosmos 3.0 LVSA (experimental).** A diffusers, single-GPU path for
   NVIDIA Cosmos 3.0, independent of the vLLM-Omni plugin:

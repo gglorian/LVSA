@@ -95,6 +95,9 @@ class HunyuanLVSAState:
         # Forward passes per denoising step. CFG runs cond + uncond = 2.
         # Without CFG (guidance_scale==1) set LVSA_CFG_PASSES=1.
         self._cfg_passes: int = max(1, int(os.environ.get("LVSA_CFG_PASSES", 2)))
+        # Per-rank passes under cfg_parallel_size=N (passes spread across N
+        # ranks). Lazily resolved + cached — see _StepCounter in attention_impl.
+        self._eff_cfg_passes: Optional[int] = None
         self._step: int = 0
         self._seen_ids: set = set()
         self._generation_seq_len: Optional[int] = None
@@ -132,9 +135,16 @@ class HunyuanLVSAState:
             else:
                 self._seen_ids.add(layer_id)
 
-        # Compute step from total call count.
+        # Compute step from total call count. Under cfg_parallel_size=N each
+        # rank only sees cfg_passes/N forwards per step — divide or the counter
+        # advances at 1/N rate (halving rotation + starving [LVSA-TIME]).
         if self._n_blocks is not None:
-            threshold = self._n_blocks * self._cfg_passes
+            if self._eff_cfg_passes is None:
+                from ._sp import cfg_parallel_world_size
+                self._eff_cfg_passes = max(
+                    1, self._cfg_passes // cfg_parallel_world_size()
+                )
+            threshold = self._n_blocks * self._eff_cfg_passes
             new_step = (self._call_count - 1) // threshold
             if new_step > self._step:
                 self._step = new_step

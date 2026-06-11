@@ -2,8 +2,8 @@
 
 LVSA's sparse pattern is over the **sequence** (the `T_lat × patches_per_frame` frame grid) and is **head-independent**. So whether LVSA engages under a given parallelism axis depends entirely on **what the attention op sees**: it needs the *full frame grid* per rank (the heads may be sharded). Axes that shard weights / heads / batch / layers leave the full sequence intact → LVSA engages. Axes that shard the *sequence* (Ulysses / Ring) only work if the full sequence is reconstructed (all-to-all) before the sparse compute.
 
-> **Legend:** ✅ verified on GPU · ✗ not supported (falls back to dense) · — not applicable
-> **Last verified:** 2026-06-10 — Wan 2.1 1.3B / 14B on 2×A100 (plugin + standalone); standalone `ulysses`+FlashInfer bit-identical to single-GPU at world=2. Update the tables when a new axis/model/path is validated (see [Updating this doc](#updating-this-doc)).
+> **Legend:** ✅ verified on GPU · ⚠️ runs/engages but with a caveat (see note) · ✗ not supported (falls back to dense) · — not applicable
+> **Last verified:** 2026-06-11 — full step-time smoke sweep (every model × axis, world=2, 2× horizon, Dense vs LVSA-FlashInfer) on 2×A100; standalone `ulysses`+FlashInfer bit-identical to single-GPU at world=2. Update the tables when a new axis/model/path is validated (see [Updating this doc](#updating-this-doc)).
 
 ## vLLM-Omni plugin
 
@@ -55,12 +55,30 @@ torchrun --nproc_per_node=2 examples/wan_generate.py \
 - **`ulysses`** reproduces the single-GPU sparse pattern exactly (all-to-all is lossless; no seam inflation), verified to track single-GPU within head-shard fp (~37 dB; bit-identical at the attention op). Requires `num_heads % world == 0` (Wan = 40 → world ∈ {1,2,4,5,8,10,20,40}). FlashInfer runs the same block-sparse CSR as single-GPU on each rank's head-shard after the all-to-all.
 - **`custom`** has no head-count constraint, but boundary guards make it a slightly denser approximation near rank seams.
 
+## Per-model support (across all three paths)
+
+Which path each model works in. **Standalone CP** = `torchrun` context-parallel; **Plugin backend** = `LVSABackend` (offline + serve, all axes); **Plugin hook** = monkey-patch serve path (TP only — sequence-parallel falls back to dense). "all axes" = TP/CFG/PP/HSDP/Ulysses engage sparse (Ring always dense).
+
+| Model | Standalone CP | Plugin backend | Plugin hook (serve) |
+|---|---|---|---|
+| Wan 2.1 1.3B | ✅ custom + ulysses (SDPA + FlashInfer) | ✅ all axes | ✅ TP |
+| Wan 2.1 14B | ✅ custom + ulysses | ✅ all axes (big-model via TP) | ✅ TP |
+| Wan 2.2 A14B | ⚠️ runs + engages sparse, but **~1.0×** at 2× (dual-transformer, compute-bound) | ✅ all axes | ✅ TP |
+| Wan 2.2 TI2V-5B | ✅ custom + ulysses (per-token-timestep CP fix verified on 2×A100; needs `720p, --reference-latent-frames 31`) | ✅ all axes — needs `720p, ref_lat 31, ppf 880` | ✅ TP |
+| HunyuanVideo 1.5 | ✅ custom + ulysses (`--cp-mode` verified on 2×A100; 16 heads → world ∈ {1,2,4,8,16}) | ✅ all axes, but **@2× memory-bound** — only HSDP fits on 2×A100 (others OOM, LVSA-engaged-then-OOM on the 261-frame activation/decode) | ✅ TP |
+| Cosmos 3.0 | ⚠️ **single-GPU only** (processor swap; CP deferred) | — (routes through the hook) | ✅ **hook: TP/CFG/PP/HSDP** · ✗ Ulysses/Ring (hook gates out SP → dense) |
+| CogVideoX 5B | experimental (correctness only, no speedup) | — | — |
+
+**Reading it:** Wan 2.1 (1.3B/14B) is the "works everywhere" case. Standalone CP is Wan-shaped (HV custom-only; TI2V-5B broken; A14B no win; Cosmos single-GPU only). The plugin **backend** is the most universal — every model engages under every axis except Ring, given the right `ref_lat`/`ppf`. **Cosmos** has no backend path; it engages only via its cross-attention **hook** (`cosmos3_hook`), which — like every hook — patches the model's own attention and so **falls back to dense under sequence-parallel** (Ulysses/Ring); it engages under the non-sequence-sharding axes (TP/CFG/PP/HSDP). Combined with no standalone CP, **Cosmos has no frame-scaling (sequence-parallel) path anywhere yet** — only weight/batch/layer sharding. Best speedup axes for the other models: **Ulysses + HSDP**; **TP is weakest** but is what unlocks the big models by sharding weights.
+
 ## What does NOT work
 
 - **Ring-SP + LVSA** (any path) — Ring streams K/V point-to-point and never materializes the full sequence → LVSA falls back to dense. Use **Ulysses** for sequence-parallel.
 - **Plugin hook path under sequence-parallel** — falls back to dense (it intercepts before the all-to-all); use the **backend** path, which engages.
 - **Standalone weight-sharding (TP / FSDP)** — not implemented. Route big models that don't fit one GPU (e.g. Wan 2.2-A14B) through the **plugin** (TP / HSDP).
 - **`ulysses` mode with `num_heads % world ≠ 0`** — raises a clear `ValueError`; use `custom` mode for those layouts (e.g. Wan-40 on world = 3 or 6).
+- ~~**Standalone CP for Wan 2.2-TI2V-5B**~~ — **FIXED + verified on 2×A100 (2026-06-11).** Root cause: TI2V's per-token timestep conditioning (`temb`/`timestep_proj` are `[B, seq, …]`) was not sharded by the CP entry-split → every block's `norm1(hidden) * (1 + scale_msa)` crashed shard-vs-full-seq. The Wan adapter `_cp_plan` now splits the root `timestep` input (mirrors diffusers-main's native plan; Wan 2.1's 1-D timestep unaffected).
+- ~~**`ulysses` CP standalone for HunyuanVideo**~~ — **FIXED + verified on 2×A100 (2026-06-11).** `--cp-mode {custom,ulysses}` is now on `hunyuan_generate.py` too. HV 1.5 has 16 heads → `ulysses` needs `world ∈ {1, 2, 4, 8, 16}`.
 
 ## Why this shape (one paragraph)
 
@@ -70,7 +88,7 @@ The block-sparse mask is computed per **frame** and applied identically across *
 
 When you validate a new axis / model / path, add a row marked ✅ and bump the **Last verified** date. The decisive check at runtime is whether the attention op receives the full grid (LVSA engages) or a sequence fragment (dense fallback):
 
-- **Engaged:** the run log shows `[LVSA-MASK] … |G|=… kfi=…` (plugin) or `attended_per_frame=N/T` (standalone), with `video_seq`/`local_seq == T_lat × P`.
-- **Fell back:** no mask line, or `[LVSA-FALLBACK] … reason=sequence_parallel|geometry_detect|…`.
+- **Engaged:** the run log shows one of — `[LVSA] Geometry detected: … video_seq=N` (plugin Wan/HV backend), `[LVSA] engaged (cosmos3): … -> SPARSE` (Cosmos hook), or `attended_per_frame=N/T` (standalone) — with `video_seq`/`local_seq == T_lat × P`.
+- **Fell back:** no engage line, or `[LVSA-FALLBACK] … reason=sequence_parallel|geometry_detect|…`. **Note:** a benign warmup `[LVSA-FALLBACK] … seq_len=1024` (a small dummy probe) appears even on successful plugin runs — only a fallback at the *real* grid size (`seq_len == T_lat × P`) means LVSA actually fell back.
 
 A 1-step run with the same `--seed` on single-GPU vs the parallel config is enough to confirm correctness: single-GPU is deterministic, and a correct parallel path diverges only by the benign head-shard kernel-fp (~36–37 dB PSNR on the decoded frames). A much larger divergence indicates a real bug, not fp drift.
