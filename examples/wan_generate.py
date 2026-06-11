@@ -193,6 +193,14 @@ def parse_args() -> argparse.Namespace:
         "per-frame SDPA. Requires flashinfer to be installed.",
     )
     lvsa.add_argument(
+        "--cp-mode", choices=["custom", "ulysses"], default="custom",
+        help="Context-parallel attention mode (multi-GPU only). "
+             "'custom' (default) = all_reduce of global K/V + boundary guards "
+             "(no head-count constraint). 'ulysses' = all-to-all gather the full "
+             "sequence, run the single-device LVSA pattern (needs num_heads %% world "
+             "== 0; budget == single-GPU, no boundary-guard inflation).",
+    )
+    lvsa.add_argument(
         "--show-mask",
         action="store_true",
         help="Print the T×T attention mask matrix showing which latent frames "

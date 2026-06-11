@@ -38,8 +38,21 @@ All notable changes to LVSA will be documented in this file. Format: [Keep a Cha
     sparse-engagement, installer-swap) + a 1-step GPU smoke across dense / 1× / 2×.
 - **`build_global_kv`** hoisted into the model-agnostic core
   (`lvsa/sparse_attention.py`; previously only the plugin had a copy).
+- `lvsa-vllm-omni/examples/offline_lvsa.py` gains `--tp` (`tensor_parallel_size`)
+  and `--ulysses` (`ulysses_degree`) flags for multi-GPU runs (were hardcoded to 1).
 
 ### Fixed
+
+- **Plugin Wan/HunyuanVideo hooks now engage LVSA under tensor-parallel.** They
+  gated on `torch.distributed.get_world_size() > 1`, which wrongly fell back to
+  dense under *pure TP* — where the per-rank sequence is still the full frame grid
+  (TP shards heads, not the sequence). They now gate on `forward_context.sp_active`
+  (new `lvsa_vllm_omni/_sp.py::is_sp_active`), so **TP engages LVSA** while
+  **Ulysses/Ring SP still falls back** (`reason=sequence_parallel`). GPU-verified:
+  Wan2.1-14B at `tensor_parallel_size=2` engages sparse LVSA (21/41 attended) and
+  generates; Ulysses=2 falls back on the sharded fragment. Unlocks Wan 2.2 14B/A14B
+  on N GPUs via TP with LVSA on. (The offline/backend path already engaged under TP
+  — it has no `world_size` gate; this fixes the serve/hook path.)
 
 - `lvsa-vllm-omni/examples/offline_lvsa.py` raises a clear `RuntimeError` when the
   pipeline returns no frames (`result.images is None`, or 0 frames after
@@ -55,7 +68,8 @@ All notable changes to LVSA will be documented in this file. Format: [Keep a Cha
   `docs/architecture.md` (new "when a model doesn't fit the ABC" section),
   `docs/quickstart.md`.
 - Skills bumped: `lvsa-quickstart` 1.2.0 → 1.3.0, `lvsa-add-model` 1.0.0 → 1.1.0
-  (processor-swap path), `lvsa-vllm-omni` 1.3.0 → 1.4.0 (standalone pointer).
+  (processor-swap path), `lvsa-vllm-omni` 1.3.0 → 1.5.0 (standalone pointer +
+  corrected multi-GPU section: TP engages LVSA, Ulysses/Ring SP falls back).
 - **Deduped `build_global_kv`.** The plugin's `lvsa_vllm_omni/global_kv.py` now
   re-exports `build_global_kv` from the core (`lvsa.sparse_attention`) instead of
   carrying a byte-identical copy; existing `from lvsa_vllm_omni.global_kv import

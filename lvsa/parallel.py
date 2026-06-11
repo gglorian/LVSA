@@ -135,6 +135,7 @@ def install_lvsa_processors(
         key_frame_interval=key_frame_interval,
         rank=rank,
         world=world,
+        cp_mode=getattr(args, "cp_mode", "custom"),
         adapter=adapter,
         sparsity_scale=sparsity_scale,
         reference_frames=ref_lat_frames,

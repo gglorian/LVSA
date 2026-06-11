@@ -61,6 +61,16 @@ def parse_args():
                          "many GPUs loading from one disk in the weekend sweep — doesn't false-timeout.")
     ap.add_argument("--output-dir", type=Path, default=Path("results_plugin_phase"))
     ap.add_argument("--output-name", required=True)
+    ap.add_argument("--tp", type=int, default=1,
+                    help="tensor_parallel_size: TP shards weights+heads, full sequence "
+                         "per rank (the axis that fits big models like Wan2.2 14B/A14B).")
+    ap.add_argument("--ulysses", type=int, default=1,
+                    help="ulysses_degree: sequence-parallel shards the frame grid → "
+                         "LVSA hooks fall back to dense (reason=sequence_parallel).")
+    ap.add_argument("--omni-kw", action="append", default=[], metavar="KEY=VAL",
+                    help="Extra Omni() kwargs (repeatable, int/bool-cast), e.g. "
+                         "--omni-kw cfg_parallel_size=2 --omni-kw pipeline_parallel_size=2 "
+                         "--omni-kw use_hsdp=true --omni-kw hsdp_shard_size=2.")
     return ap.parse_args()
 
 
@@ -145,7 +155,16 @@ def main():
     print(f"[offline_lvsa] family={a.family} backend={a.backend} lvsa={lvsa} T_lat={t_lat} "
           f"frames={a.num_frames} {a.width}x{a.height} steps={a.steps} "
           f"sparsity={a.sparsity_scale if (lvsa and a.sparsity_scale is not None) else 1.0}", flush=True)
-    omni = Omni(model=a.model, tensor_parallel_size=1, dtype="bfloat16", **omni_kwargs)
+    if a.ulysses > 1:
+        omni_kwargs["ulysses_degree"] = a.ulysses
+    for kv in a.omni_kw:
+        k, _, v = kv.partition("=")
+        if v.lower() in ("true", "false"):
+            v = v.lower() == "true"
+        elif v.lstrip("-").isdigit():
+            v = int(v)
+        omni_kwargs[k] = v
+    omni = Omni(model=a.model, tensor_parallel_size=a.tp, dtype="bfloat16", **omni_kwargs)
     try:
         pk = dict(
             height=a.height, width=a.width, num_frames=a.num_frames,
