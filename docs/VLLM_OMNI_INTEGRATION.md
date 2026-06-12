@@ -49,19 +49,23 @@ pip install --no-build-isolation \
 # (the DIFFUSION_ATTENTION_BACKEND env var was removed). The `python -m
 # lvsa_vllm_omni.serve` wrapper injects this flag for you; the raw form is:
 
-# Enable for HunyuanVideo
-LVSA_HUNYUAN_HOOK=1 \
+# Enable for HunyuanVideo — the backend alone is sufficient (preferred path)
 LVSA_AUTO_KEYFRAMES=1 \
 LVSA_REFERENCE_LATENT_FRAMES=33 \
 vllm serve --omni --model HunyuanVideo-1.5-Diffusers-480p_t2v \
   --diffusion-attention-config '{"per_role": {"self": {"backend": "LVSA"}}}'
 
-# Enable for Wan (also needs the Wan hook explicit)
-LVSA_WAN_HOOK=1 \
+# Enable for Wan — same: backend only, no hook needed
 LVSA_AUTO_KEYFRAMES=1 \
 LVSA_REFERENCE_LATENT_FRAMES=21 \
 vllm serve --omni --model Wan2.2-T2V-14B \
   --diffusion-attention-config '{"per_role": {"self": {"backend": "LVSA"}}}'
+
+# The monkey-patch hooks (LVSA_WAN_HOOK=1 / LVSA_HUNYUAN_HOOK=1) are an
+# ALTERNATIVE to the backend, not a prerequisite. Prefer the backend: it runs
+# after the framework all-to-all, so it stays sparse under Ulysses
+# sequence-parallel, where the hooks fall back to dense. Cosmos 3.0 is the
+# exception — it has no backend path and engages via LVSA_COSMOS3_HOOK=1.
 ```
 
 The plugin entry point in `pyproject.toml` registers `lvsa_vllm_omni:register` under `vllm_omni.general_plugins`, which fires at vLLM-Omni startup.
