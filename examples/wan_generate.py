@@ -398,6 +398,12 @@ def main() -> None:
     # ── Context-parallel plan (multi-GPU only) ────────────────────────────────
     if world > 1:
         setup_context_parallel(adapter, pipe.transformer, world)
+        # Wan2.2-A14B dual-expert: transformer_2 needs its own CP plan or its
+        # (low-noise) steps compute the full sequence replicated on every rank.
+        if getattr(pipe, "transformer_2", None) is not None:
+            setup_context_parallel(adapter, pipe.transformer_2, world)
+            if rank == 0:
+                print("[LVSA] context-parallel enabled on transformer_2 (dual-expert)")
 
     if rank == 0:
         print(f"[model] loaded in {time.time() - t0:.1f}s")

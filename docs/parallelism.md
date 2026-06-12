@@ -63,7 +63,7 @@ Which path each model works in. **Standalone CP** = `torchrun` context-parallel;
 |---|---|---|---|
 | Wan 2.1 1.3B | ✅ custom + ulysses (SDPA + FlashInfer) | ✅ all axes | ✅ TP |
 | Wan 2.1 14B | ✅ custom + ulysses | ✅ all axes (big-model via TP) | ✅ TP |
-| Wan 2.2 A14B | ⚠️ runs + engages sparse, but **~1.0×** at 2× (dual-transformer, compute-bound) | ✅ all axes | ✅ TP |
+| Wan 2.2 A14B | ✅ custom + ulysses — **both experts** wired (LVSA + CP on `transformer_2` too; verified 1.23× flat, matches 14B) | ✅ all axes | ✅ TP |
 | Wan 2.2 TI2V-5B | ✅ custom + ulysses (per-token-timestep CP fix verified on 2×A100; needs `720p, --reference-latent-frames 31`) | ✅ all axes — needs `720p, ref_lat 31, ppf 880` | ✅ TP |
 | HunyuanVideo 1.5 | ✅ custom + ulysses (`--cp-mode` verified on 2×A100; 16 heads → world ∈ {1,2,4,8,16}) | ✅ all axes, but **@2× memory-bound** — only HSDP fits on 2×A100 (others OOM, LVSA-engaged-then-OOM on the 261-frame activation/decode) | ✅ TP |
 | Cosmos 3.0 | ⚠️ **single-GPU only** (processor swap; CP deferred) | — (routes through the hook) | ✅ **hook: TP/CFG/PP/HSDP** · ✗ Ulysses/Ring (hook gates out SP → dense) |

@@ -164,9 +164,19 @@ class WanAdapter(ModelAdapter):
     # ── Pipeline integration ──────────────────────────────────────────────────
 
     def install_processor(self, pipe: Any, processor: Any) -> int:
-        for block in pipe.transformer.blocks:
-            block.attn1.processor = processor
-        return len(pipe.transformer.blocks)
+        # Wan2.2-A14B is a boundary-ratio dual-expert: `transformer` (high
+        # noise) + `transformer_2` (low noise), timestep-switched. Both must be
+        # patched or expert-2 steps silently run dense full-attention. Sharing
+        # one processor is safe: identical geometry, experts never run
+        # concurrently.
+        count = 0
+        for tf in (pipe.transformer, getattr(pipe, "transformer_2", None)):
+            if tf is None:
+                continue
+            for block in tf.blocks:
+                block.attn1.processor = processor
+            count += len(tf.blocks)
+        return count
 
     def setup_context_parallel(self, transformer: Any, world: int) -> None:
         from diffusers import ContextParallelConfig

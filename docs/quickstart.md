@@ -92,7 +92,7 @@ settings are:
 - `LVSA_AUTO_KEYFRAMES=1` — auto-derive the keyframe interval
 - `LVSA_REFERENCE_LATENT_FRAMES=33` — model's training horizon in latent frames (33 for HunyuanVideo, 21 for Wan, 13 for CogVideoX)
 
-For Wan, also set `LVSA_WAN_HOOK=1` and `LVSA_REFERENCE_LATENT_FRAMES=21`.
+For Wan, set `LVSA_REFERENCE_LATENT_FRAMES=21`. (`LVSA_WAN_HOOK=1` is **not** needed — Wan runs through the LVSA attention backend by default; the hook is an alternative monkey-patch path and falls back to dense under sequence-parallel.)
 
 ### Non-standard resolutions
 

@@ -6,6 +6,13 @@ All notable changes to LVSA will be documented in this file. Format: [Keep a Cha
 
 ### Fixed
 
+- **Wan2.2-A14B standalone: second expert ran unwired.** `install_processor`
+  and the CP setup only covered `pipe.transformer`; the A14B dual-expert's
+  `transformer_2` (low-noise steps, boundary-switched) silently ran dense
+  full-attention **replicated on every rank** — measured ~1.0× "speedup" and
+  escalating step times. Both experts now get the LVSA processor and their own
+  CP plan. Verified on 2×A100: flat per-step times, 1.23× (matches wan14b).
+  Plugin path was never affected (the framework wires all attention layers).
 - **Wan2.2-TI2V-5B standalone context-parallel crash.** TI2V's per-token
   timestep conditioning (`expand_timesteps`: `timestep` is `[B, seq]`, so
   `temb`/`timestep_proj` are per-token) was not sharded by the CP entry-split,

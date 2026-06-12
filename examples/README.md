@@ -50,6 +50,8 @@ Key flags:
 - `--auto-keyframes` — auto-derive keyframe interval from frame count
 - `--rotate-keyframes` — shift keyframe grid each denoising step (recommended at extension)
 - `--sparsity-scale` — multiplier on the attention budget (default 1.0; 0.5 = aggressive)
+- `--cp-mode {custom,ulysses}` — multi-GPU CP attention mode (also on `hunyuan_generate.py`): `custom` (default) = all-reduced global K/V + boundary guards, no head-count constraint; `ulysses` = all-to-all to the exact single-device pattern, needs `num_heads % world == 0` (Wan 40, HV 16)
+- `--reference-latent-frames` — override the training horizon in latent frames (set `31` for Wan2.2-TI2V-5B)
 - `--riflex --riflex-s 2.0` — compose with RIFLEx RoPE rescaling
 
 Full `--help` output: `python examples/wan_generate.py --help`.
