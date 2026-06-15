@@ -96,7 +96,7 @@ python examples/cosmos_generate.py \
 ```
 
 **Requirements / notes:**
-- Needs **diffusers main** (`>=0.39.0.dev0`) for `Cosmos3OmniPipeline`. Standard-release diffusers (used by the other models) stops at Cosmos 2.5.
+- Needs **diffusers main** (`>=0.39.0.dev0`) for `Cosmos3OmniPipeline`. Standard-release diffusers (used by the other models) stops at Cosmos 2.5. Note `pip install lvsa[diffusers]` only floors diffusers at `>=0.31` (enough for the other models + CI); for Cosmos you must install diffusers main explicitly (`pip install "git+https://github.com/huggingface/diffusers.git"`) or `cosmos_generate.py` fails at import.
 - Cosmos is **separate-stream**: the diffusers `Cosmos3AttnProcessor` runs the text/VLM `und` tokens as causal self-attention and the video `gen` tokens as full attention over `cat([k_und, k_gen])`. LVSA wraps **only the gen pathway** (window gen↔gen + keyframes, all `und` kept global) and leaves the `und` causal path byte-identical. It engages via a **processor swap** (`lvsa/cosmos3.py::install_cosmos3_lvsa`), not the adapter ABC.
 - MVP scope: **single-GPU** (no `torchrun`), **SDPA** backend, fixed keyframes (no `--rotate-keyframes`). FlashInfer and Ulysses CP are follow-ups.
 - `reference_latent_frames=48` (189-frame native horizon) is the default; override with `--sparsity-scale < 1` for more sparsity below the cap.

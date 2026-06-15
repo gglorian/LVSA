@@ -8,8 +8,18 @@ def test_cosmos3_geometry_720p_189f():
     assert cosmos3_latent_frames(189) == 48
     assert cosmos3_latent_frames(1) == 1
     # VAE spatial 16, latent patch 2 -> P = ceil(H/32)*ceil(W/32); 720x1280 -> 23*40
-    assert cosmos3_patches_per_frame(720, 1280) == 23 * 40 == 920
+    assert cosmos3_patches_per_frame(720, 1280) == 23 * 40
+    assert cosmos3_patches_per_frame(720, 1280) == 920
     assert COSMOS3_REFERENCE_LATENT_FRAMES == 48
+
+
+def test_cosmos3_geometry_non_round_resolution():
+    """Lock the ceil() behavior the gen-path geometry assertion depends on:
+    non-multiple-of-32 dims must round UP (ceil), not floor. 540x960:
+    ceil(540/32)=17, ceil(960/32)=30 -> 510 (floor would give 16*30=480)."""
+    from lvsa.cosmos3 import cosmos3_patches_per_frame
+    assert cosmos3_patches_per_frame(540, 960) == 17 * 30 == 510
+    assert cosmos3_patches_per_frame(481, 481) == 16 * 16  # ceil(481/32)=16
 
 
 import torch
@@ -45,6 +55,13 @@ def _rope_tuple(s_und, s_gen, head_dim):
     return (cos_u, sin_u, cos_g, sin_g)
 
 
+# NOTE (CI coverage): the two tests below — the 1x==dense equivalence and the
+# sparse-engagement check — are the only ones that exercise the actual processor
+# *numerics*, and both importorskip on diffusers main. CI runs release diffusers,
+# so CI does NOT cover the gen/und attention math; it covers only geometry, the
+# batched guard, the geometry-mismatch guard, and the installer. A green CI does
+# not certify the processor numerics — run these locally on diffusers main (or a
+# scheduled main-pinned job) after any change to the attention path.
 def test_lvsa_processor_matches_dense_at_1x():
     # Cosmos3 lives in diffusers main only — skip on release diffusers (e.g. CI).
     pytest.importorskip("diffusers.models.transformers.transformer_cosmos3")
@@ -137,3 +154,31 @@ def test_batched_input_raises_not_corrupts():
     )
     with pytest.raises(NotImplementedError, match="batch"):
         proc(attn=None, und_seq=bad, gen_seq=bad, rotary_emb=None)
+
+
+def test_gen_geometry_mismatch_raises():
+    """A gen stream whose length != T_lat*P must raise loudly, not silently
+    corrupt: build_global_kv indexes frame*P and the output is sliced per frame,
+    so a one-token layout drift garbles attention with no error otherwise. The
+    check fires before __call__'s lazy diffusers import (runs on release
+    diffusers); attn=None proves it raises before any model use. T_lat=4, P=2
+    -> expected gen length 8."""
+    from lvsa.cosmos3 import Cosmos3LVSAAttnProcessor
+    proc = Cosmos3LVSAAttnProcessor(
+        total_latent_frames=4, num_patches=2, reference_latent_frames=2,
+    )
+    good = torch.randn(8, 16)            # 4 * 2 = 8 tokens, correct
+    wrong = torch.randn(7, 16)           # off-by-one -> must raise
+    und = torch.randn(3, 16)
+    # correct length passes the geometry gate (then fails later on attn=None,
+    # NOT with a ValueError about geometry)
+    with pytest.raises(Exception) as ei:
+        proc(attn=None, und_seq=und, gen_seq=good, rotary_emb=None)
+    assert "T_lat*P" not in str(ei.value), "correct geometry must pass the gate"
+    # wrong length is rejected at the geometry gate
+    with pytest.raises(ValueError, match=r"T_lat\*P"):
+        proc(attn=None, und_seq=und, gen_seq=wrong, rotary_emb=None)
+    # 3-D [1, S, C] form is handled too (shape[-2])
+    with pytest.raises(ValueError, match=r"T_lat\*P"):
+        proc(attn=None, und_seq=und.unsqueeze(0), gen_seq=wrong.unsqueeze(0),
+             rotary_emb=None)

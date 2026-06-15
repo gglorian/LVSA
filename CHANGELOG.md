@@ -11,6 +11,14 @@ All notable changes to LVSA will be documented in this file. Format: [Keep a Cha
   into sequence — only correct for one sample per call. `Cosmos3OmniPipeline`
   guarantees that (sequential CFG), but a batched (`B>1`) input now raises a
   clear `NotImplementedError` instead of silently cross-contaminating samples.
+- **Geometry length assertion on `Cosmos3LVSAAttnProcessor`** (PR #5 review
+  follow-up). The gen path assumes the stream is exactly `T_lat * P` tokens
+  (`build_global_kv` indexes `frame*P`, output is sliced per frame); a layout
+  drift from an odd-resolution VAE pad/floor would silently misalign attention.
+  `__call__` now raises a clear `ValueError` at the first forward when
+  `gen_seq` length ≠ `T_lat * P`. Also: `install_cosmos3_lvsa` asserts it
+  patched ≥1 layer (catches a renamed/empty `transformer.layers`), and a
+  non-round-resolution geometry test locks the `ceil()` patch-count behavior.
 
 - **Standalone Cosmos 3.0 LVSA (experimental).** A diffusers, single-GPU path for
   NVIDIA Cosmos 3.0, independent of the vLLM-Omni plugin:

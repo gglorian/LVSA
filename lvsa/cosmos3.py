@@ -85,6 +85,21 @@ class Cosmos3LVSAAttnProcessor:
 
     def __call__(self, attn, und_seq, gen_seq, rotary_emb):
         _require_unbatched(und_seq, gen_seq)
+        # Geometry contract: the gen stream MUST be exactly T_lat * P tokens.
+        # build_global_kv indexes frame*P+offset and the output is sliced per
+        # frame, so even a one-token layout drift (e.g. an unexpected VAE
+        # pad/floor at an odd resolution) silently misaligns attention with no
+        # error. Assert loudly at the first forward instead. Fires before the
+        # lazy diffusers import below, so it is unit-testable on release
+        # diffusers (see test_gen_geometry_mismatch_raises).
+        S_gen = gen_seq.shape[-2] if gen_seq.ndim == 3 else gen_seq.shape[0]
+        expected = self.metadata.total_latent_frames * self.P
+        if S_gen != expected:
+            raise ValueError(
+                f"Cosmos3 gen seq length {S_gen} != T_lat*P ({expected}; "
+                f"T_lat={self.metadata.total_latent_frames}, P={self.P}). "
+                "Geometry mismatch — check num_frames/height/width vs the model."
+            )
         # NOTE: mirrors diffusers Cosmos3AttnProcessor internals (private _rotate_half + projection attr names); re-verify on diffusers bump.
         from diffusers.models.transformers.transformer_cosmos3 import (
             _rotate_half, dispatch_attention_fn,
@@ -150,6 +165,11 @@ def install_cosmos3_lvsa(transformer, num_frames, height, width,
     for layer in transformer.layers:
         layer.self_attn.set_processor(proc)
         n += 1
+    assert n > 0, (
+        "install_cosmos3_lvsa patched 0 layers — transformer.layers is empty "
+        "or renamed (diffusers may use a different block container). Check the "
+        "Cosmos3 transformer structure."
+    )
     if T_lat <= reference_latent_frames:
         print(f"[LVSA] Cosmos3: T_lat={T_lat} <= ref={reference_latent_frames} "
               f"-> dense regime (no sparsity at this horizon).")
