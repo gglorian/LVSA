@@ -127,6 +127,7 @@ For the algorithmic details, see [`docs/architecture.md`](docs/architecture.md).
 | [`docs/VLLM_OMNI_INTEGRATION.md`](docs/VLLM_OMNI_INTEGRATION.md) | How the vllm-omni plugin is wired |
 | [`lvsa-vllm-omni/README.md`](lvsa-vllm-omni/README.md) | Plugin reference: env vars, configuration, distributed serving |
 | [`benchmarks/README.md`](benchmarks/README.md) | Reproduce the headline numbers |
+| [`benchmarks/results_v1.2.0.md`](benchmarks/results_v1.2.0.md) | Full release-1.2.0 sweep results (5 models × 6 horizons, VQeval + VBench-Long) |
 | [`vqeval/README.md`](vqeval/README.md) | Video-quality assessment used in the paper |
 
 ## Supported models
