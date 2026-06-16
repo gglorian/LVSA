@@ -28,6 +28,7 @@ python generate_figures.py                 →  PNGs in docs/figures/
 | [`score_vqeval.sh`](score_vqeval.sh) | VQeval scoring wrapper (uses the bundled `vqeval/` subpackage) |
 | [`score_vbench.sh`](score_vbench.sh) | VBench-Long scoring wrapper (requires external VBench install) |
 | [`aggregate.py`](aggregate.py) | Walks an output dir, parses `<tag>.{vqeval,vbench}.json` + logs, writes tidy + means CSVs |
+| [`results_v1.2.0.md`](results_v1.2.0.md) | **Results** — full release-1.2.0 sweep (5 models × 6 horizons, VQeval + VBench-Long, speed + quality, Dense vs LVSA) |
 | [`generate_figures.py`](generate_figures.py) | Regenerates the 4 PNG figures in `docs/figures/` from aggregated CSVs |
 
 ## SotA comparison (5 methods × 3 horizons × 5 prompts)
