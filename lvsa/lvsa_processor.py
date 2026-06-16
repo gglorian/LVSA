@@ -891,20 +891,29 @@ class DistributedLVSAProcessor:
         world==1 skips the all-to-alls (identity) -> pure single-device.
         """
         H = query.shape[2]
+        H_kv = key.shape[2]   # may be < H under GQA (num_kv_heads < num_heads)
         if self.world > 1:
-            if H % self.world != 0:
+            # Both Q and KV head counts are sharded by the all-to-all (scatter
+            # dim=2), so both must divide world — and the per-rank GQA ratio
+            # H/H_kv is preserved. For MHA (H == H_kv) this is identical to the
+            # single-count path. All currently-supported ulysses-CP models are
+            # MHA; this keeps it correct if a GQA model gains CP support.
+            if H % self.world != 0 or H_kv % self.world != 0:
                 raise ValueError(
-                    f"cp_mode='ulysses' needs num_heads ({H}) divisible by "
-                    f"world ({self.world}); use cp_mode='custom' for this layout."
+                    f"cp_mode='ulysses' needs both num_heads ({H}) and "
+                    f"num_kv_heads ({H_kv}) divisible by world ({self.world}); "
+                    f"use cp_mode='custom' for this layout."
                 )
             query = _ulysses_all_to_all(query, 2, 1, self.world)
             key = _ulysses_all_to_all(key, 2, 1, self.world)
             value = _ulysses_all_to_all(value, 2, 1, self.world)
             if enc_k is not None:
-                hl = H // self.world
-                h0 = self.rank * hl
-                enc_k = enc_k[:, :, h0:h0 + hl, :].contiguous()
-                enc_v = enc_v[:, :, h0:h0 + hl, :].contiguous()
+                # Encoder K/V carry KV heads — slice with the KV head count, not
+                # the (possibly larger) query head count.
+                hl_kv = H_kv // self.world
+                h0_kv = self.rank * hl_kv
+                enc_k = enc_k[:, :, h0_kv:h0_kv + hl_kv, :].contiguous()
+                enc_v = enc_v[:, :, h0_kv:h0_kv + hl_kv, :].contiguous()
 
         k_global, v_global = build_global_kv(
             key, value, self._ulysses_metadata.global_indices, self._num_patches,

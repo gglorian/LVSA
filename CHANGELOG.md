@@ -66,6 +66,12 @@ All notable changes to LVSA will be documented in this file. Format: [Keep a Cha
 
 ### Fixed
 
+- **Ulysses CP under GQA.** The standalone `cp-mode ulysses` path validated only
+  `num_heads % world`, and sliced encoder K/V by the query head count — wrong if
+  `num_kv_heads < num_heads` (grouped-query attention). It now validates
+  `num_kv_heads % world` too and slices encoder K/V by the KV head count. No-op
+  for the MHA models that currently use this path (Wan, HunyuanVideo); hardens it
+  for a future GQA model.
 - **Wan2.2-A14B standalone: second expert ran unwired.** `install_processor`
   and the CP setup only covered `pipe.transformer`; the A14B dual-expert's
   `transformer_2` (low-noise steps, boundary-switched) silently ran dense

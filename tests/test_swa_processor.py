@@ -995,6 +995,29 @@ def test_ulysses_equals_custom_with_encoder_world1():
     assert torch.allclose(out_uly, out_custom, atol=1e-5)
 
 
+def test_ulysses_validates_kv_head_count_under_gqa():
+    """Ulysses CP all-to-alls BOTH Q and KV heads (scatter dim=2), so both must
+    divide world — not just num_heads. Under GQA (num_kv_heads < num_heads) the
+    KV count can be indivisible even when Q divides. The guard must reject it
+    (and slice encoder K/V by the KV count). Fires before the all-to-all, so it
+    is CPU-testable. PR #6 review (GQA head-count). All shipped ulysses-CP models
+    are MHA today; this protects a future GQA model."""
+    import torch
+    from lvsa.lvsa_processor import DistributedLVSAProcessor
+    p = DistributedLVSAProcessor(
+        total_num_latent_frames=12, num_patches=3, window_size=1,
+        n_first_frames=1, key_frame_interval=None, rank=0, world=3,
+        cp_mode="ulysses", reference_frames=3,
+    )
+    S = 12 * 3
+    q = torch.randn(1, S, 12, 8)          # 12 query heads — divisible by world=3
+    k = torch.randn(1, S, 8, 8)           # 8 KV heads — NOT divisible by 3 (GQA)
+    v = torch.randn(1, S, 8, 8)
+    ek = torch.randn(1, 5, 8, 8); ev = torch.randn(1, 5, 8, 8)
+    with pytest.raises(ValueError, match="num_kv_heads"):
+        p._compute_lvsa_ulysses(q, k, v, ek, ev)
+
+
 # ── FlashInfer ulysses path (GPU-only) ────────────────────────────────────────
 
 def _flashinfer_gpu_unavailable():
