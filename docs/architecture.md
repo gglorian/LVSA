@@ -154,11 +154,17 @@ Both produce numerically equivalent outputs within FP16/BF16 noise. FlashInfer's
 
 ## Multi-GPU paths
 
-LVSA supports **Ulysses-style context parallelism** on top of standard PyTorch distributed primitives. The sequence dim is sharded across ranks; each rank holds a full model copy and processes its local token shard. Global K/V are gathered before the sparse-attention call.
+LVSA's sparse mask is over the sequence (frame grid) and is **head-independent**, so it engages under any parallelism that leaves the *full grid* visible at the attention call (tensor / CFG / data / pipeline / HSDP parallelism, and sequence-parallel once the all-to-all reconstructs the grid). It falls back to dense only under Ring sequence-parallel (which never materializes the full K/V).
 
-`setup_context_parallel()` on the adapter wires the rank-aware sharding into the model's pipeline. The processor handles the rest.
+Standalone context-parallel (`torchrun`) offers two modes via `--cp-mode`:
+- **`custom`** (default) — seq-shard + `all_reduce` of global K/V + boundary guards. Per-rank attention on the local shard.
+- **`ulysses`** — all-to-all gather the full grid (head-sharded), run the exact single-device pattern, all-to-all scatter. No boundary guards; needs `num_heads % world == 0`.
 
-**Constraint**: `seq_len = T_lat × patches_per_frame` must be divisible by `world_size`.
+`setup_context_parallel()` on the adapter installs the diffusers entry-split/exit-gather (shared by both modes); `DistributedLVSAProcessor.__call__` branches on `cp_mode` for the per-layer attention.
+
+**Constraint**: `seq_len = T_lat × patches_per_frame` must be divisible by `world_size` (custom); `ulysses` additionally needs `num_heads % world_size == 0`.
+
+**Full support matrix** (plugin + standalone, per axis, with verification status): see [`parallelism.md`](parallelism.md).
 
 ## Code map
 

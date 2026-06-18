@@ -95,6 +95,9 @@ class HunyuanLVSAState:
         # Forward passes per denoising step. CFG runs cond + uncond = 2.
         # Without CFG (guidance_scale==1) set LVSA_CFG_PASSES=1.
         self._cfg_passes: int = max(1, int(os.environ.get("LVSA_CFG_PASSES", 2)))
+        # Per-rank passes under cfg_parallel_size=N (passes spread across N
+        # ranks). Lazily resolved + cached — see _StepCounter in attention_impl.
+        self._eff_cfg_passes: Optional[int] = None
         self._step: int = 0
         self._seen_ids: set = set()
         self._generation_seq_len: Optional[int] = None
@@ -132,9 +135,16 @@ class HunyuanLVSAState:
             else:
                 self._seen_ids.add(layer_id)
 
-        # Compute step from total call count.
+        # Compute step from total call count. Under cfg_parallel_size=N each
+        # rank only sees cfg_passes/N forwards per step — divide or the counter
+        # advances at 1/N rate (halving rotation + starving [LVSA-TIME]).
         if self._n_blocks is not None:
-            threshold = self._n_blocks * self._cfg_passes
+            if self._eff_cfg_passes is None:
+                from ._sp import cfg_parallel_world_size
+                self._eff_cfg_passes = max(
+                    1, self._cfg_passes // cfg_parallel_world_size()
+                )
+            threshold = self._n_blocks * self._eff_cfg_passes
             new_step = (self._call_count - 1) // threshold
             if new_step > self._step:
                 self._step = new_step
@@ -255,35 +265,35 @@ def install_hunyuan_lvsa_hook(total_latent_frames: int) -> None:
         # cadence is identical to before this early-return guard was added.
         step_idx = state.tick(id(self), video_seq)
 
-        # ── Distributed CP guard ──
-        # Under Ulysses / Ring SP, ``video_seq`` is the per-rank shard, not the
-        # full T_lat × P. Geometry detection would silently corrupt the
-        # attention pattern. Fall back to dense in that case.
-        try:
-            import torch.distributed as _dist
-            _is_distributed = _dist.is_initialized() and _dist.get_world_size() > 1
-        except Exception:
-            _is_distributed = False
+        # ── Sequence-parallel guard ──
+        # Tensor-parallel keeps the full sequence per rank (shards heads) → LVSA
+        # is correct under TP. Sequence-parallel (Ulysses/Ring) shards the
+        # sequence → ``video_seq`` is a per-rank fragment of T_lat × P → fall
+        # back. Gate on SP specifically (forward_context.sp_active), NOT total
+        # world size — the old ``get_world_size() > 1`` wrongly disabled LVSA
+        # under pure TP.
+        from ._sp import is_sp_active
+        _sp_active = is_sp_active()
 
         # ── Geometry / stream checks BEFORE any projection ──
         # Performing these first avoids wasting QKV / RoPE compute on warmup or
-        # unsupported distributed runs, and — critically — prevents deriving a
-        # truncated patch count ``P`` from a non-divisible warmup sequence,
-        # which would otherwise silently corrupt the sparse attention pattern.
+        # unsupported SP runs, and — critically — prevents deriving a truncated
+        # patch count ``P`` from a non-divisible warmup sequence, which would
+        # otherwise silently corrupt the sparse attention pattern.
         geometry_ok = (
             total_latent_frames > 0
             and video_seq % total_latent_frames == 0
             and encoder_hidden_states is not None
-            and not _is_distributed
+            and not _sp_active
         )
 
         if not geometry_ok:
             from ._fallback import warn_fallback
             if encoder_hidden_states is None:
                 reason, extra = "no_encoder", {"step": step_idx}
-            elif _is_distributed:
-                reason = "distributed_cp"
-                extra = {"step": step_idx, "world_size": _dist.get_world_size()}
+            elif _sp_active:
+                reason = "sequence_parallel"
+                extra = {"step": step_idx, "sp_active": True}
             else:
                 reason = "geometry_mismatch"
                 extra = {"step": step_idx, "T_lat": total_latent_frames}

@@ -4,6 +4,9 @@ All notable changes to LVSA will be documented in this file. Format: [Keep a Cha
 
 ## [Unreleased]
 
+
+## [1.3.0] — 2026-06-16
+
 ### Added
 
 - **Batched-input guard on `Cosmos3LVSAAttnProcessor`** (PR #5 review follow-up).
@@ -19,6 +22,11 @@ All notable changes to LVSA will be documented in this file. Format: [Keep a Cha
   `gen_seq` length ≠ `T_lat * P`. Also: `install_cosmos3_lvsa` asserts it
   patched ≥1 layer (catches a renamed/empty `transformer.layers`), and a
   non-round-resolution geometry test locks the `ceil()` patch-count behavior.
+
+- **`--cp-mode {custom,ulysses}` on `examples/hunyuan_generate.py`** — exposes
+  the standalone plain-Ulysses CP mode for HunyuanVideo (previously Wan-only;
+  the processor already supported it). HunyuanVideo 1.5 has 16 heads, so
+  `ulysses` needs `world ∈ {1, 2, 4, 8, 16}`.
 
 - **Standalone Cosmos 3.0 LVSA (experimental).** A diffusers, single-GPU path for
   NVIDIA Cosmos 3.0, independent of the vLLM-Omni plugin:
@@ -38,15 +46,8 @@ All notable changes to LVSA will be documented in this file. Format: [Keep a Cha
     sparse-engagement, installer-swap) + a 1-step GPU smoke across dense / 1× / 2×.
 - **`build_global_kv`** hoisted into the model-agnostic core
   (`lvsa/sparse_attention.py`; previously only the plugin had a copy).
-
-### Fixed
-
-- `lvsa-vllm-omni/examples/offline_lvsa.py` raises a clear `RuntimeError` when the
-  pipeline returns no frames (`result.images is None`, or 0 frames after
-  conversion) instead of an opaque `AttributeError`.
-- `examples/cosmos_generate.py` passes `enable_safety_checker=False` to
-  `from_pretrained` so the pipeline doesn't construct `CosmosSafetyChecker` at load
-  (which requires the external `cosmos_guardrail` package).
+- `lvsa-vllm-omni/examples/offline_lvsa.py` gains `--tp` (`tensor_parallel_size`)
+  and `--ulysses` (`ulysses_degree`) flags for multi-GPU runs (were hardcoded to 1).
 
 ### Changed
 
@@ -55,12 +56,62 @@ All notable changes to LVSA will be documented in this file. Format: [Keep a Cha
   `docs/architecture.md` (new "when a model doesn't fit the ABC" section),
   `docs/quickstart.md`.
 - Skills bumped: `lvsa-quickstart` 1.2.0 → 1.3.0, `lvsa-add-model` 1.0.0 → 1.1.0
-  (processor-swap path), `lvsa-vllm-omni` 1.3.0 → 1.4.0 (standalone pointer).
+  (processor-swap path), `lvsa-vllm-omni` 1.3.0 → 1.5.0 (standalone pointer +
+  corrected multi-GPU section: TP engages LVSA, Ulysses/Ring SP falls back).
 - **Deduped `build_global_kv`.** The plugin's `lvsa_vllm_omni/global_kv.py` now
   re-exports `build_global_kv` from the core (`lvsa.sparse_attention`) instead of
   carrying a byte-identical copy; existing `from lvsa_vllm_omni.global_kv import
   build_global_kv` imports (Wan / HunyuanVideo / Cosmos hooks, plugin tests) are
   unchanged.
+
+### Fixed
+
+- **Ulysses CP under GQA.** The standalone `cp-mode ulysses` path validated only
+  `num_heads % world`, and sliced encoder K/V by the query head count — wrong if
+  `num_kv_heads < num_heads` (grouped-query attention). It now validates
+  `num_kv_heads % world` too and slices encoder K/V by the KV head count. No-op
+  for the MHA models that currently use this path (Wan, HunyuanVideo); hardens it
+  for a future GQA model.
+- **Wan2.2-A14B standalone: second expert ran unwired.** `install_processor`
+  and the CP setup only covered `pipe.transformer`; the A14B dual-expert's
+  `transformer_2` (low-noise steps, boundary-switched) silently ran dense
+  full-attention **replicated on every rank** — measured ~1.0× "speedup" and
+  escalating step times. Both experts now get the LVSA processor and their own
+  CP plan. Verified on 2×A100: flat per-step times, 1.23× (matches wan14b).
+  Plugin path was never affected (the framework wires all attention layers).
+- **Wan2.2-TI2V-5B standalone context-parallel crash.** TI2V's per-token
+  timestep conditioning (`expand_timesteps`: `timestep` is `[B, seq]`, so
+  `temb`/`timestep_proj` are per-token) was not sharded by the CP entry-split,
+  crashing every block's `norm1(hidden) * (1 + scale_msa)` with a
+  shard-vs-full-seq mismatch under `torchrun`. The Wan adapter's `_cp_plan` now
+  also splits the root `timestep` input (`expected_dims=2` — Wan 2.1's 1-D
+  timestep is unaffected), mirroring diffusers-main's native Wan plan.
+- **Plugin step counter under CFG-parallel.** Both step counters (backend
+  `_StepCounter` and hook `HunyuanLVSAState`, shared by the Cosmos hook)
+  assumed all CFG passes run on every rank; under `cfg_parallel_size=N` the
+  passes are spread across N ranks, so the counter advanced at 1/N rate —
+  halving `--rotate-keyframes` rotation and starving the `[LVSA-TIME]` /
+  `[LVSA-MEM]` per-step logs. Per-rank passes are now derived via the new
+  `_sp.cfg_parallel_world_size()`.
+
+
+- **Plugin Wan/HunyuanVideo hooks now engage LVSA under tensor-parallel.** They
+  gated on `torch.distributed.get_world_size() > 1`, which wrongly fell back to
+  dense under *pure TP* — where the per-rank sequence is still the full frame grid
+  (TP shards heads, not the sequence). They now gate on `forward_context.sp_active`
+  (new `lvsa_vllm_omni/_sp.py::is_sp_active`), so **TP engages LVSA** while
+  **Ulysses/Ring SP still falls back** (`reason=sequence_parallel`). GPU-verified:
+  Wan2.1-14B at `tensor_parallel_size=2` engages sparse LVSA (21/41 attended) and
+  generates; Ulysses=2 falls back on the sharded fragment. Unlocks Wan 2.2 14B/A14B
+  on N GPUs via TP with LVSA on. (The offline/backend path already engaged under TP
+  — it has no `world_size` gate; this fixes the serve/hook path.)
+
+- `lvsa-vllm-omni/examples/offline_lvsa.py` raises a clear `RuntimeError` when the
+  pipeline returns no frames (`result.images is None`, or 0 frames after
+  conversion) instead of an opaque `AttributeError`.
+- `examples/cosmos_generate.py` passes `enable_safety_checker=False` to
+  `from_pretrained` so the pipeline doesn't construct `CosmosSafetyChecker` at load
+  (which requires the external `cosmos_guardrail` package).
 
 ## [1.2.0] — 2026-06-08
 

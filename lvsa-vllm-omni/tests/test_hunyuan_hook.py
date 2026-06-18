@@ -213,3 +213,26 @@ class TestImportSurface:
         # Calling it without vllm-omni should raise an ImportError, not an arbitrary error
         with pytest.raises((ImportError, ModuleNotFoundError)):
             install_hunyuan_lvsa_hook(total_latent_frames=33)
+
+
+class TestHookStepCounterCFGParallel:
+    """Hook-side mirror of TestStepCounterCFGParallel (attention_impl): under
+    cfg_parallel_size=N each rank sees cfg_passes/N forwards per step."""
+
+    def test_cfg_world2_step_advances_every_nblocks(self, monkeypatch):
+        import lvsa_vllm_omni._sp as sp
+        monkeypatch.setattr(sp, "cfg_parallel_world_size", lambda: 2)
+        s = HunyuanLVSAState(LVSAConfig())
+        # calibrate n_blocks=3 (layer ids 1,2,3 then repeat), then with
+        # cfg_world=2 a step is 3 calls (2 passes / 2 ranks = 1 pass per rank)
+        steps = [s.tick(layer_id=(i % 3) + 1, seq_len=100) for i in range(10)]
+        # calibration burns the first pass; once calibrated steps advance every 3
+        assert steps[-1] >= 2, f"step counter stuck at {steps[-1]} (steps={steps})"
+
+    def test_cfg_world1_unchanged(self, monkeypatch):
+        import lvsa_vllm_omni._sp as sp
+        monkeypatch.setattr(sp, "cfg_parallel_world_size", lambda: 1)
+        s = HunyuanLVSAState(LVSAConfig())
+        steps = [s.tick(layer_id=(i % 3) + 1, seq_len=100) for i in range(13)]
+        # 3 blocks x 2 passes = 6 calls/step -> after 13 calls step == 2
+        assert steps[-1] == 2, f"steps={steps}"

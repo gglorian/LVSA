@@ -193,6 +193,14 @@ def parse_args() -> argparse.Namespace:
         "per-frame SDPA. Requires flashinfer to be installed.",
     )
     lvsa.add_argument(
+        "--cp-mode", choices=["custom", "ulysses"], default="custom",
+        help="Context-parallel attention mode (multi-GPU only). "
+             "'custom' (default) = all_reduce of global K/V + boundary guards "
+             "(no head-count constraint). 'ulysses' = all-to-all gather the full "
+             "sequence, run the single-device LVSA pattern (needs num_heads %% world "
+             "== 0; budget == single-GPU, no boundary-guard inflation).",
+    )
+    lvsa.add_argument(
         "--show-mask",
         action="store_true",
         help="Print the T×T attention mask matrix showing which latent frames "
@@ -390,6 +398,12 @@ def main() -> None:
     # ── Context-parallel plan (multi-GPU only) ────────────────────────────────
     if world > 1:
         setup_context_parallel(adapter, pipe.transformer, world)
+        # Wan2.2-A14B dual-expert: transformer_2 needs its own CP plan or its
+        # (low-noise) steps compute the full sequence replicated on every rank.
+        if getattr(pipe, "transformer_2", None) is not None:
+            setup_context_parallel(adapter, pipe.transformer_2, world)
+            if rank == 0:
+                print("[LVSA] context-parallel enabled on transformer_2 (dual-expert)")
 
     if rank == 0:
         print(f"[model] loaded in {time.time() - t0:.1f}s")

@@ -21,6 +21,7 @@ from lvsa.sparse_attention import lvsa_sdpa
 
 from .config import LVSAConfig
 from ._fallback import warn_fallback
+from ._sp import is_sp_active
 
 
 # Reuse HunyuanLVSAState — it is model-agnostic (step tracking, metadata cache).
@@ -68,35 +69,33 @@ def install_wan_lvsa_hook(total_latent_frames: int) -> None:
         # cadence is identical to before this early-return guard was added.
         step_idx = state.tick(id(self), local_seq)
 
-        # ── Distributed CP guard ──
-        # Under Ulysses / Ring SP, the sequence dimension is sharded across
-        # ranks before this forward runs. ``local_seq`` no longer equals the
-        # full T_lat × P, so the LVSA geometry detection would silently match
-        # the wrong P. Fall back to dense — a per-rank LVSA pattern is not
-        # supported in this release.
-        try:
-            import torch.distributed as _dist
-            _is_distributed = _dist.is_initialized() and _dist.get_world_size() > 1
-        except Exception:
-            _is_distributed = False
+        # ── Sequence-parallel guard ──
+        # LVSA's frame-grid geometry needs the FULL sequence. Tensor-parallel
+        # keeps the full sequence per rank (it shards heads) → LVSA is correct
+        # under TP (verified: Wan2.1-14B TP=2 engages sparse, 21/41 attended).
+        # Sequence-parallel (Ulysses/Ring) shards the sequence before this forward
+        # → ``local_seq`` is a per-rank fragment of T_lat × P → fall back. Gate on
+        # SP specifically (forward_context.sp_active), NOT total world size — the
+        # old ``get_world_size() > 1`` wrongly disabled LVSA under pure TP.
+        _sp_active = is_sp_active()
 
         # ── Geometry check BEFORE any projection ──
         # Doing this first avoids wasting QKV / QK-norm / RoPE compute on warmup
-        # (small seq) or distributed runs that are guaranteed to fall back.
+        # (small seq) or SP runs that are guaranteed to fall back.
         # full_seq must equal T_lat * P (no encoder tokens in Wan self-attn).
         geometry_ok = (
             total_latent_frames > 0
             and full_seq % total_latent_frames == 0
-            and not _is_distributed
+            and not _sp_active
         )
 
         if not geometry_ok:
             warn_fallback(
                 origin="wan_hook",
-                reason="distributed_cp" if _is_distributed else "geometry_mismatch",
+                reason="sequence_parallel" if _sp_active else "geometry_mismatch",
                 seq_len=local_seq,
                 extra={"T_lat": total_latent_frames, "full_seq": full_seq,
-                       "distributed": _is_distributed},
+                       "sp_active": _sp_active},
             )
             # Delegate to the original (dense) forward rather than reimplement
             # the attention call — keeps us correct against vllm-omni's evolving

@@ -123,9 +123,11 @@ For the algorithmic details, see [`docs/architecture.md`](docs/architecture.md).
 | [`docs/tuning.md`](docs/tuning.md) | `sparsity_scale`, `reference_latent_frames`, picking knobs for your model |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | Silent fallbacks, OOM, output-path bugs, common gotchas |
 | [`docs/architecture.md`](docs/architecture.md) | Adapter pattern, how to add a new model |
+| [`docs/parallelism.md`](docs/parallelism.md) | Multi-GPU support matrix (TP / CFG / DP / PP / HSDP / Ulysses / Ring) for plugin + standalone, with verification status |
 | [`docs/VLLM_OMNI_INTEGRATION.md`](docs/VLLM_OMNI_INTEGRATION.md) | How the vllm-omni plugin is wired |
 | [`lvsa-vllm-omni/README.md`](lvsa-vllm-omni/README.md) | Plugin reference: env vars, configuration, distributed serving |
 | [`benchmarks/README.md`](benchmarks/README.md) | Reproduce the headline numbers |
+| [`benchmarks/results_v1.2.0.md`](benchmarks/results_v1.2.0.md) | Full release-1.2.0 sweep results (5 models × 6 horizons, VQeval + VBench-Long) |
 | [`vqeval/README.md`](vqeval/README.md) | Video-quality assessment used in the paper |
 
 ## Supported models
@@ -134,10 +136,10 @@ For the algorithmic details, see [`docs/architecture.md`](docs/architecture.md).
 |---|---|---|---|
 | Wan 2.1 / 2.2 T2V | 1.3B, 14B | **stable** | `21` |
 | HunyuanVideo 1.5 | — | **stable** | `33` |
-| Cosmos 3.0 | Nano 16B | experimental — correctness-validated (standalone + plugin); SDPA, single-GPU | `48` |
+| Cosmos 3.0 | Nano 16B | experimental — standalone: single-GPU, SDPA; plugin: FlashInfer + multi-GPU (TP/CFG/PP/HSDP) | `48` |
 | CogVideoX | 5B | experimental (correctness only — no speedup) | `13` |
 
-Cosmos 3.0 standalone needs **diffusers main** (`>=0.39.0.dev0`, for `Cosmos3OmniPipeline`) and engages LVSA via a **processor swap** (`lvsa/cosmos3.py::install_cosmos3_lvsa`) rather than the adapter ABC — its separate-stream attention (text/VLM `und` causal + video `gen` full-attention) doesn't fit the ABC. The MVP is single-GPU, SDPA, fixed keyframes; FlashInfer + Ulysses are follow-ups.
+Cosmos 3.0 standalone needs **diffusers main** (`>=0.39.0.dev0`, for `Cosmos3OmniPipeline`) and engages LVSA via a **processor swap** (`lvsa/cosmos3.py::install_cosmos3_lvsa`) rather than the adapter ABC — its separate-stream attention (text/VLM `und` causal + video `gen` full-attention) doesn't fit the ABC. The standalone MVP is single-GPU, SDPA, fixed keyframes. The vLLM-Omni plugin path (`cosmos3_hook`) runs Cosmos with FlashInfer and rotation under TP/CFG/PP/HSDP; sequence-parallel (Ulysses/Ring) falls back to dense in the hook — see [`docs/parallelism.md`](docs/parallelism.md).
 
 Adding a new model takes ~200 lines (one adapter file). See [`docs/architecture.md`](docs/architecture.md).
 

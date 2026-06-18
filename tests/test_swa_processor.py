@@ -886,3 +886,219 @@ class TestReferenceFramesPropagation:
         proc = self._make(T=21, ref=21, W=3, n_first=1)
         assert proc.key_frame_interval == 1
         assert len(proc._metadata.global_set) == 21
+
+
+def test_cp_mode_plumbing():
+    import pytest
+    from lvsa.lvsa_processor import DistributedLVSAProcessor
+    common = dict(total_num_latent_frames=6, num_patches=2, window_size=1,
+                  n_first_frames=1, key_frame_interval=1, rank=0, world=1)
+    p_default = DistributedLVSAProcessor(**common)
+    assert p_default._cp_mode == "custom"          # default = current behaviour
+    p_uly = DistributedLVSAProcessor(cp_mode="ulysses", **common)
+    assert p_uly._cp_mode == "ulysses"
+    with pytest.raises(ValueError):
+        DistributedLVSAProcessor(cp_mode="bogus", **common)
+
+
+def test_ulysses_metadata_is_single_device():
+    from lvsa.lvsa_processor import DistributedLVSAProcessor
+    T, P = 24, 2          # 24 latent frames, 2 patches/frame
+    p = DistributedLVSAProcessor(
+        total_num_latent_frames=T, num_patches=P, window_size=1,
+        n_first_frames=1, key_frame_interval=None, rank=0, world=1,
+        cp_mode="ulysses", reference_frames=6,   # 24 > 6 -> sparse
+    )
+    m = p._ulysses_metadata
+    assert m.local_seq == T * P                 # full sequence, not a shard
+    assert m.global_token_start == 0
+    assert 0 < len(m.global_indices) < T        # genuinely sparse at 4x ref
+    # custom mode must NOT build the ulysses metadata
+    p_custom = DistributedLVSAProcessor(
+        total_num_latent_frames=T, num_patches=P, window_size=1,
+        n_first_frames=1, key_frame_interval=None, rank=0, world=1,
+        cp_mode="custom", reference_frames=6,
+    )
+    assert p_custom._ulysses_metadata is None
+
+
+def test_ulysses_equals_custom_at_world1():
+    import torch
+    from lvsa.lvsa_processor import DistributedLVSAProcessor
+    torch.manual_seed(0)
+    T, P, H, D = 12, 4, 8, 16
+    S = T * P; B = 1
+
+    def make(mode):
+        return DistributedLVSAProcessor(
+            total_num_latent_frames=T, num_patches=P, window_size=1,
+            n_first_frames=1, key_frame_interval=None, rank=0, world=1,
+            cp_mode=mode, reference_frames=3,    # 12 > 3 -> sparse
+        )
+    q = torch.randn(B, S, H, D); k = torch.randn(B, S, H, D); v = torch.randn(B, S, H, D)
+
+    pc = make("custom")
+    kg, vg = pc._build_global_kv(k, v)
+    out_custom = pc._compute_lvsa(q, k, v, kg, vg, None)
+    out_uly = make("ulysses")._compute_lvsa_ulysses(q, k, v, None, None)
+
+    assert out_uly.shape == out_custom.shape == (B, S, H, D)
+    assert torch.allclose(out_uly, out_custom, atol=1e-5), \
+        "ulysses world=1 path must equal the custom world=1 path"
+
+
+def test_ulysses_metadata_rebuilds_on_rotation():
+    from lvsa.lvsa_processor import DistributedLVSAProcessor
+    T, P = 24, 2
+    # Explicit kfi so the periodic keyframe grid is rotatable via set_step.
+    p = DistributedLVSAProcessor(
+        total_num_latent_frames=T, num_patches=P, window_size=1,
+        n_first_frames=1, key_frame_interval=6, rank=0, world=1,
+        cp_mode="ulysses", reference_frames=6,
+    )
+    assert p.key_frame_interval, "expected a keyframe interval to rotate"
+    g0 = list(p._ulysses_metadata.global_indices)
+    m0 = list(p._metadata.global_indices)
+    # Pick a step that produces a non-zero offset so the keyframe grid shifts.
+    p.set_step(1)
+    g1 = list(p._ulysses_metadata.global_indices)
+    m1 = list(p._metadata.global_indices)
+    # The ulysses metadata must track the custom metadata in lockstep.
+    assert g1 == m1, "ulysses metadata must mirror _metadata after rotation"
+    assert (g1 != g0) or (m1 != m0), \
+        "rotation must change both metadatas (or neither) — stale ulysses meta"
+    # And they must still agree with each other after the rebuild.
+    assert g0 == m0
+
+
+def test_ulysses_equals_custom_with_encoder_world1():
+    import torch
+    from lvsa.lvsa_processor import DistributedLVSAProcessor
+    torch.manual_seed(1)
+    T, P, H, D = 10, 2, 4, 8
+    S = T * P
+    q = torch.randn(1, S, H, D); k = torch.randn(1, S, H, D); v = torch.randn(1, S, H, D)
+    enc_k = torch.randn(1, 5, H, D); enc_v = torch.randn(1, 5, H, D)   # 5 text tokens
+
+    def make(mode):
+        return DistributedLVSAProcessor(
+            total_num_latent_frames=T, num_patches=P, window_size=1,
+            n_first_frames=1, key_frame_interval=None, rank=0, world=1,
+            cp_mode=mode, reference_frames=3,
+        )
+    # custom: append enc to the (single-GPU) global K/V then compute
+    pc = make("custom")
+    kg, vg = pc._build_global_kv(k, v)
+    kg = torch.cat([kg, enc_k], dim=1); vg = torch.cat([vg, enc_v], dim=1)
+    out_custom = pc._compute_lvsa(q, k, v, kg, vg, None)
+    out_uly = make("ulysses")._compute_lvsa_ulysses(q, k, v, enc_k, enc_v)
+    assert torch.allclose(out_uly, out_custom, atol=1e-5)
+
+
+def test_ulysses_validates_kv_head_count_under_gqa():
+    """Ulysses CP all-to-alls BOTH Q and KV heads (scatter dim=2), so both must
+    divide world — not just num_heads. Under GQA (num_kv_heads < num_heads) the
+    KV count can be indivisible even when Q divides. The guard must reject it
+    (and slice encoder K/V by the KV count). Fires before the all-to-all, so it
+    is CPU-testable. PR #6 review (GQA head-count). All shipped ulysses-CP models
+    are MHA today; this protects a future GQA model."""
+    import torch
+    from lvsa.lvsa_processor import DistributedLVSAProcessor
+    p = DistributedLVSAProcessor(
+        total_num_latent_frames=12, num_patches=3, window_size=1,
+        n_first_frames=1, key_frame_interval=None, rank=0, world=3,
+        cp_mode="ulysses", reference_frames=3,
+    )
+    S = 12 * 3
+    q = torch.randn(1, S, 12, 8)          # 12 query heads — divisible by world=3
+    k = torch.randn(1, S, 8, 8)           # 8 KV heads — NOT divisible by 3 (GQA)
+    v = torch.randn(1, S, 8, 8)
+    ek = torch.randn(1, 5, 8, 8); ev = torch.randn(1, 5, 8, 8)
+    with pytest.raises(ValueError, match="num_kv_heads"):
+        p._compute_lvsa_ulysses(q, k, v, ek, ev)
+
+
+# ── FlashInfer ulysses path (GPU-only) ────────────────────────────────────────
+
+def _flashinfer_gpu_unavailable():
+    """True when the block-sparse FlashInfer kernel can't run here (no CUDA, or
+    no AOT/JIT cache so plan() would invoke nvcc). Used to skip GPU-only tests."""
+    if not torch.cuda.is_available():
+        return True
+    try:
+        import flashinfer  # noqa: F401
+    except Exception:
+        return True
+    return False
+
+
+_FI_SKIP = pytest.mark.skipif(
+    _flashinfer_gpu_unavailable(),
+    reason="needs CUDA + a runnable FlashInfer (AOT/JIT cache)",
+)
+
+
+@_FI_SKIP
+def test_ulysses_flashinfer_equals_custom_flashinfer_world1():
+    """The flashinfer ulysses path (self._ufi / _ulysses_metadata) must match the
+    flashinfer custom path (self._fi / _metadata) at world=1: both reduce to the
+    exact single-device block-sparse pattern, so they share the same CSR."""
+    torch.manual_seed(0)
+    T, P, H, D = 12, 16, 8, 64   # D=64, P=16 -> FlashInfer-friendly block geometry
+    S = T * P; B = 1
+    dev = "cuda"
+
+    def make(mode):
+        p = DistributedLVSAProcessor(
+            total_num_latent_frames=T, num_patches=P, window_size=1,
+            n_first_frames=1, key_frame_interval=None, rank=0, world=1,
+            cp_mode=mode, reference_frames=3,        # 12 > 3 -> sparse
+        )
+        p._use_flashinfer = True
+        return p
+
+    q = torch.randn(B, S, H, D, device=dev, dtype=torch.bfloat16)
+    k = torch.randn(B, S, H, D, device=dev, dtype=torch.bfloat16)
+    v = torch.randn(B, S, H, D, device=dev, dtype=torch.bfloat16)
+
+    pc = make("custom")
+    kg, vg = pc._build_global_kv(k, v)
+    out_custom = pc._compute_lvsa(q, k, v, kg, vg, None)
+    out_uly = make("ulysses")._compute_lvsa_ulysses(q, k, v, None, None)
+
+    assert out_uly.shape == out_custom.shape == (B, S, H, D)
+    # Same CSR, same kernel, same inputs at world=1 -> bit-identical.
+    assert torch.equal(out_uly, out_custom), \
+        "ulysses-flashinfer world=1 must equal custom-flashinfer world=1"
+
+
+@_FI_SKIP
+def test_ulysses_flashinfer_equals_custom_flashinfer_with_encoder_world1():
+    """Same world=1 flashinfer equivalence, dual-stream (encoder K/V appended)."""
+    torch.manual_seed(1)
+    T, P, H, D = 10, 16, 8, 64
+    S = T * P; B = 1
+    dev = "cuda"
+    q = torch.randn(B, S, H, D, device=dev, dtype=torch.bfloat16)
+    k = torch.randn(B, S, H, D, device=dev, dtype=torch.bfloat16)
+    v = torch.randn(B, S, H, D, device=dev, dtype=torch.bfloat16)
+    enc_k = torch.randn(B, 5, H, D, device=dev, dtype=torch.bfloat16)   # 5 text tokens
+    enc_v = torch.randn(B, 5, H, D, device=dev, dtype=torch.bfloat16)
+
+    def make(mode):
+        p = DistributedLVSAProcessor(
+            total_num_latent_frames=T, num_patches=P, window_size=1,
+            n_first_frames=1, key_frame_interval=None, rank=0, world=1,
+            cp_mode=mode, reference_frames=3,
+        )
+        p._use_flashinfer = True
+        return p
+
+    pc = make("custom")
+    kg, vg = pc._build_global_kv(k, v)
+    kg = torch.cat([kg, enc_k], dim=1); vg = torch.cat([vg, enc_v], dim=1)
+    out_custom = pc._compute_lvsa(q, k, v, kg, vg, None)
+    out_uly = make("ulysses")._compute_lvsa_ulysses(q, k, v, enc_k, enc_v)
+
+    assert torch.equal(out_uly, out_custom), \
+        "ulysses-flashinfer world=1 (dual-stream) must equal custom-flashinfer"

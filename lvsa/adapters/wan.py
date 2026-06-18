@@ -164,9 +164,19 @@ class WanAdapter(ModelAdapter):
     # ── Pipeline integration ──────────────────────────────────────────────────
 
     def install_processor(self, pipe: Any, processor: Any) -> int:
-        for block in pipe.transformer.blocks:
-            block.attn1.processor = processor
-        return len(pipe.transformer.blocks)
+        # Wan2.2-A14B is a boundary-ratio dual-expert: `transformer` (high
+        # noise) + `transformer_2` (low noise), timestep-switched. Both must be
+        # patched or expert-2 steps silently run dense full-attention. Sharing
+        # one processor is safe: identical geometry, experts never run
+        # concurrently.
+        count = 0
+        for tf in (pipe.transformer, getattr(pipe, "transformer_2", None)):
+            if tf is None:
+                continue
+            for block in tf.blocks:
+                block.attn1.processor = processor
+            count += len(tf.blocks)
+        return count
 
     def setup_context_parallel(self, transformer: Any, world: int) -> None:
         from diffusers import ContextParallelConfig
@@ -187,6 +197,21 @@ class WanAdapter(ModelAdapter):
                 gather_dim=1,
                 expected_dims=3,
             ),
+            # Wan2.2 TI2V-5B uses per-token timestep conditioning
+            # (expand_timesteps): `timestep` arrives as [B, seq], making
+            # temb/timestep_proj per-token — they must be sharded alongside
+            # hidden_states or every block's `norm1(hidden) * (1 + scale_msa)`
+            # shape-crashes under CP. Splitting the root timestep input keeps
+            # condition_embedder's outputs per-rank. Wan2.1's 1-D timestep is
+            # unaffected (expected_dims=2 → split skipped when ndim != 2).
+            # Mirrors diffusers-main's native WanTransformer3DModel._cp_plan.
+            "": {
+                "timestep": ContextParallelInput(
+                    split_dim=1,
+                    expected_dims=2,
+                    split_output=False,
+                ),
+            },
         }
         transformer.enable_parallelism(
             config=ContextParallelConfig(ulysses_degree=world),

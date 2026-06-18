@@ -470,3 +470,73 @@ class TestAdapterInterface:
         for method in optional:
             assert hasattr(adapter, method)
             assert callable(getattr(adapter, method))
+
+
+class TestWanCPPlan:
+    """The CP plan must split per-token timestep conditioning (Wan2.2 TI2V-5B).
+
+    TI2V's expand_timesteps mode makes `timestep` [B, seq] -> temb/timestep_proj
+    become per-token ([B, seq, 6, D] / [B, seq, D]). The entry-split shards
+    hidden_states only, so without a root-level timestep split every block's
+    `norm1(hidden) * (1 + scale_msa)` crashes with a 27280-vs-54560 mismatch
+    under torchrun CP. Mirrors diffusers-main's native Wan _cp_plan. Wan2.1's
+    1-D timestep is unaffected (expected_dims=2 -> split skipped on ndim != 2).
+    """
+
+    def test_cp_plan_splits_per_token_timestep(self):
+        from types import SimpleNamespace
+        adapter = WanAdapter()
+        captured = {}
+        transformer = SimpleNamespace(
+            enable_parallelism=lambda config: captured.setdefault("config", config),
+        )
+        adapter.setup_context_parallel(transformer, world=2)
+
+        plan = transformer._cp_plan
+        assert "" in plan, "plan must include the root module for the timestep input"
+        ts = plan[""]["timestep"]
+        assert ts.split_dim == 1
+        assert ts.expected_dims == 2          # [B, seq] (TI2V); ndim=1 (Wan2.1) skipped
+        assert ts.split_output is False
+        # existing entries must survive
+        assert plan["blocks.0"]["hidden_states"].split_dim == 1
+        assert plan["proj_out"].gather_dim == 1
+
+
+class TestWanDualTransformerInstall:
+    """Wan2.2-A14B is a boundary-ratio dual-expert: `transformer` (high-noise)
+    + `transformer_2` (low-noise), timestep-switched. install_processor must
+    patch BOTH or expert-2 steps silently run dense full-attention (found via
+    the perf sweep: a14b standalone showed ~1.0x because 3 of 4 steps ran the
+    unwired expert)."""
+
+    @staticmethod
+    def _fake_pipe(n_blocks=3, dual=False):
+        from types import SimpleNamespace
+
+        def make_transformer():
+            blocks = [
+                SimpleNamespace(attn1=SimpleNamespace(processor=None))
+                for _ in range(n_blocks)
+            ]
+            return SimpleNamespace(blocks=blocks)
+
+        pipe = SimpleNamespace(transformer=make_transformer())
+        # match the real pipeline: attribute exists, None for single-expert
+        pipe.transformer_2 = make_transformer() if dual else None
+        return pipe
+
+    def test_single_transformer_unchanged(self):
+        adapter = WanAdapter()
+        pipe = self._fake_pipe(n_blocks=3, dual=False)
+        proc = object()
+        assert adapter.install_processor(pipe, proc) == 3
+        assert all(b.attn1.processor is proc for b in pipe.transformer.blocks)
+
+    def test_dual_transformer_patches_both_experts(self):
+        adapter = WanAdapter()
+        pipe = self._fake_pipe(n_blocks=3, dual=True)
+        proc = object()
+        assert adapter.install_processor(pipe, proc) == 6
+        assert all(b.attn1.processor is proc for b in pipe.transformer.blocks)
+        assert all(b.attn1.processor is proc for b in pipe.transformer_2.blocks)

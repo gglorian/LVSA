@@ -116,6 +116,7 @@ All LVSA parameters are set via environment variables (`LVSA_*`) or a JSON confi
 | `LVSA_KEY_FRAME_INTERVAL` | 16 | Periodic keyframe interval |
 | `LVSA_AUTO_KEYFRAMES` | true | Auto-compute keyframe interval from `LVSA_REFERENCE_LATENT_FRAMES` |
 | `LVSA_ROTATE_KEYFRAMES` | false | Shift keyframe grid each step (anti-looping) |
+| `LVSA_EXPAND_WINDOW` | true | Expand the local window outward when it overlaps global frames (matches the standalone default); set `0` for the adaptive (non-expanded) window |
 | `LVSA_SPARSITY_SCALE` | 1.0 | Multiplier on per-query attention budget. `<1` = more sparse, `>1` = less sparse. Quality/speed knob. |
 | `LVSA_REFERENCE_LATENT_FRAMES` | 21 | Model's training-horizon latent frame count. **Set per model**: Wan=21, HunyuanVideo=33, CogVideoX=13. |
 
@@ -160,6 +161,9 @@ The plugin must infer `seq_len = T_lat × P + enc_tokens` from the raw token ten
 | `LVSA_WARN_FALLBACK` | true | Print one-line warnings on silent dense fallback (recommended on) |
 | `LVSA_MEM_LOG` | 0 | Per-step device memory logging — emits `[LVSA-MEM] step=N alloc=… reserved=… peak=…` once per denoising step. Device-agnostic (CUDA + Ascend NPU). Wired in all three plugin paths (`attention_impl`, `hunyuan_hook`, `wan_hook`). |
 | `LVSA_STEP_TIME_LOG` | 0 | Per-step wall-clock log — emits `[LVSA-TIME] step=N dt=…s` for the step that just completed. Same coverage as `LVSA_MEM_LOG`. |
+| `LVSA_COSMOS3_HOOK` | 0 | Install the Cosmos 3.0 LVSA hook (`cosmos3_hook.py`) at `register_lvsa_backend()`. Cosmos has no backend path — this hook is how Cosmos engages LVSA. |
+| `LVSA_DISPATCH_BACKEND` | auto | (Cosmos hook) Force the diffusers `dispatch_attention_fn` backend for the und/causal pathway (e.g. `flash`, `native`). Leave unset for diffusers' default. |
+| `LVSA_REPEAT_KV` | 0 | (Cosmos hook, ablation) Force legacy `repeat_interleave` GQA instead of native grouped-KV — 4× more KV traffic; only for debugging parity. |
 | `LVSA_MASK_LOG` | — | Per-step compact attention-mask dump (G=global, W=window, X=both, .=skip). Values: `1` every step, `once` first step only, `N` step N only, `N-M` inclusive range, `N,M,K` specific steps. Useful to confirm the sparsity pattern at a given denoising step. |
 | `LVSA_N_BLOCKS` | auto | Override the expected attention-block count per step. Used by `step_tracker` to detect step boundaries; auto-detected on the first step normally. |
 | `LVSA_CONFIG` | — | JSON string overriding all `LVSA_*` env vars above |
@@ -254,13 +258,18 @@ If your pipeline runs CFG with `guidance_scale > 1` (two forward passes per step
 (single forward), set `LVSA_CFG_PASSES=1`. Mismatching this value with your pipeline's
 CFG behavior misaligns the rotation phase but does not affect correctness.
 
+Under **CFG-parallel** (`cfg_parallel_size=N`) the framework spreads the CFG passes across
+N ranks, so each rank only sees `cfg_passes / N` forwards per step. The counter divides by
+the CFG-parallel world size automatically — keep `LVSA_CFG_PASSES` at its single-rank
+meaning (2 with CFG, 1 without); do **not** pre-divide it yourself.
+
 Common configurations:
 
-| Pipeline | guidance | `LVSA_CFG_PASSES` | `LVSA_TOTAL_STEPS` |
-|---|---|---|---|
-| Wan/HunyuanVideo with CFG (default) | > 1 | 2 (default) | match `num_inference_steps` |
-| Anything with CFG short-circuited | == 1 | 1 | match `num_inference_steps` |
-| `LVSA_CFG_PASSES=k` for k forwards/step | — | k | match `num_inference_steps` |
+| Pipeline | guidance | `LVSA_CFG_PASSES` |
+|---|---|---|
+| Wan/HunyuanVideo with CFG (default) | > 1 | 2 (default) |
+| Anything with CFG short-circuited | == 1 | 1 |
+| `LVSA_CFG_PASSES=k` for k forwards/step | — | k |
 
 To verify the counter is calibrated correctly, look for this log line during the first
 denoising step:
