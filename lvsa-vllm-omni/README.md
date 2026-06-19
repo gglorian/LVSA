@@ -147,7 +147,7 @@ The plugin must infer `seq_len = T_lat × P + enc_tokens` from the raw token ten
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LVSA_HUNYUAN_HOOK` | false | Install HunyuanVideo LVSA hook at class level |
-| `LVSA_WAN_HOOK` | false | Install Wan LVSA hook (intercepts before `_sp_plan`). **Required for Wan**. |
+| `LVSA_WAN_HOOK` | false | Install Wan LVSA hook. **Optional / legacy — not required for Wan.** Wan LVSA engages by default via the **backend** (`WanSelfAttention.self.attn` → `LVSABackend`) under single-GPU, TP, and Ulysses. The hook instead reimplements `WanSelfAttention.forward` inline; under sequence-parallel its inline path bails and **delegates to the backend** (`self.attn`), which re-engages LVSA on the framework-gathered grid (LVSA is *not* lost — the hook just adds nothing there). Even under TP it is **not bit-identical** to the backend (~31.6 dB — same sparse pattern and identical RoPE/scale/kernel, but the hook runs *inside* `torch.compile` while the backend's attention is `@torch.compiler.disable`/eager; a benign compiled-vs-eager gap, eager being the faithful reference). Do **not** set it unless you hit a config where the backend doesn't engage. |
 
 ### Distributed serving
 
@@ -236,7 +236,7 @@ vllm-omni calls `load_omni_general_plugins()` in the main process, engine, and e
 
 `register_lvsa_backend()` also triggers the optional monkey-patches (each env-var guarded and no-op otherwise):
 - `maybe_install_hunyuan_hook()` — dual-stream LVSA on HunyuanVideo (activated by `LVSA_HUNYUAN_HOOK=1`)
-- `maybe_install_wan_hook()` — LVSA on Wan (activated by `LVSA_WAN_HOOK=1`, needed because Wan pre-shards sequences via `_sp_plan`)
+- `maybe_install_wan_hook()` — **legacy** LVSA-on-Wan path (activated by `LVSA_WAN_HOOK=1`). Not needed by default: the current `WanSelfAttention.forward` routes self-attention through a pluggable `self.attn` seam, so the **backend** handles Wan (including under Ulysses, where the framework all-to-all gathers the full grid before `self.attn`). The hook instead monkey-patches `WanSelfAttention.forward` wholesale; under sequence-parallel its inline path delegates to the original forward (→ `self.attn` → backend), so the backend re-engages LVSA on the gathered grid (the `[LVSA-FALLBACK]` log line says so explicitly: `… delegating to self.attn — LVSA backend RE-ENGAGES …`, not "DENSE").
 
 ---
 

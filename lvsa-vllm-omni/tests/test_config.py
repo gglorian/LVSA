@@ -57,6 +57,21 @@ class TestConfigFromEnv:
         c = LVSAConfig.from_env()
         assert c.sparsity_scale == 2.5
 
+    def test_expand_window_zero_disables(self, monkeypatch):
+        """Parity fix #6: LVSA_EXPAND_WINDOW=0 must yield expand_window=False.
+
+        The vllm-omni hooks feed ``config.expand_window`` into the authoritative
+        ``LVSAMetadata.build`` call, so this flag must round-trip through from_env
+        for the documented adaptive-window mode to actually take effect.
+        """
+        monkeypatch.setenv("LVSA_EXPAND_WINDOW", "0")
+        assert LVSAConfig.from_env().expand_window is False
+
+    def test_expand_window_defaults_true(self, monkeypatch):
+        monkeypatch.delenv("LVSA_EXPAND_WINDOW", raising=False)
+        monkeypatch.delenv("LVSA_CONFIG", raising=False)
+        assert LVSAConfig.from_env().expand_window is True
+
 
 class TestConfigFromJson:
     def test_parses_json(self):

@@ -5,6 +5,23 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
+# ── LVSA_CFG_PASSES ──────────────────────────────────────────────────────────
+# Not a field on ``LVSAConfig`` — read directly from the environment by the
+# call-counting step trackers (``_StepCounter`` in attention_impl.py and
+# ``HunyuanLVSAState`` in hunyuan_hook.py). It is the number of forward passes
+# per denoising step assumed by those *fallback* heuristics.
+#
+# Default 2 matches classifier-free guidance (cond + uncond per step). For
+# **no-CFG** (``guidance_scale == 1``) or **guidance-distilled** models served
+# on pipelines that do NOT publish the native ``denoise_step_idx`` — i.e.
+# HunyuanVideo 1.5 / Cosmos in vllm-omni 0.22.0 — set ``LVSA_CFG_PASSES=1`` so
+# the inferred step (and the --rotate-keyframes rotation cadence) is correct;
+# leaving it at 2 makes the counter advance at half rate.
+#
+# Wan 2.2 pipelines publish the native step (read via
+# ``step_tracker.native_denoise_step()``), which is authoritative and
+# short-circuits the heuristic — so Wan 2.2 ignores LVSA_CFG_PASSES.
+
 
 @dataclass
 class LVSAConfig:
@@ -108,6 +125,14 @@ class LVSAConfig:
 #   2. Derivation from ``LVSA_VIDEO_HEIGHT``, ``LVSA_VIDEO_WIDTH``,
 #      ``LVSA_VAE_SPATIAL_FACTOR`` (default 8), ``LVSA_PATCH_SIZE`` (default 2).
 #   3. Built-in default: {1560} (Wan/HunyuanVideo at 480×832).
+#
+# NOTE: ``LVSA_VAE_SPATIAL_FACTOR`` defaults to 8 (Wan/HunyuanVideo). Cosmos 3.0
+# uses spatial factor **16**, not 8, so resolution-derived P would be WRONG for
+# Cosmos. In practice Cosmos engages via ``cosmos3_hook``, which computes
+# ``P = video_seq // T_lat`` directly — bypassing this derivation entirely — so
+# the default-8 mismatch does not bite there. Only if you ever route Cosmos
+# through the generic backend (not the hook) must you set
+# ``LVSA_PATCHES_PER_FRAME`` explicitly (or LVSA_VAE_SPATIAL_FACTOR=16).
 
 _DEFAULT_PPF = 1560
 
