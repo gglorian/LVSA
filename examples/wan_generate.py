@@ -30,6 +30,14 @@ torchrun --nproc_per_node=4 wan_parallel_lvsa.py \\
     --lvsa --window-size 32 --n-first-frames 16 --key-frame-interval 16
 """
 
+import sys
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from examples._runner import (
+    add_common_args, add_lvsa_args, resolve_distributed,
+    make_step_callback, setup_cp, build_output_path,
+)
+
 import os
 import time
 import argparse
@@ -45,63 +53,37 @@ from lvsa.parallel import (
     patch_rotary_emb_for_context_parallel,
     install_lvsa_processors,
     compute_and_validate_seq_len,
-    setup_context_parallel,
 )
 
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Wan video generation with optional LVSA and multi-GPU context parallelism",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── Model ─────────────────────────────────────────────────────────────────
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        metavar="PATH",
-        help="Path or HuggingFace Hub ID of the Wan pipeline "
-        "(e.g. /models/Wan2.2-T2V-A14B-Diffusers).",
-    )
+    add_common_args(parser)
+    add_lvsa_args(parser)
 
-    # ── Prompt ────────────────────────────────────────────────────────────────
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        required=True,
-        help="Text prompt describing the video to generate.",
-    )
-    parser.add_argument(
-        "--negative-prompt",
-        type=str,
-        default=(
+    # Restore wan's per-model defaults for the common flags that add_common_args left unset:
+    parser.set_defaults(
+        steps=40,
+        num_frames=81,
+        height=480,
+        width=832,
+        fps=16,
+        negative_prompt=(
             "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，"
             "整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，"
             "画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，"
             "静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
         ),
-        help="Negative prompt (default: standard Wan quality filter).",
     )
 
-    # ── Video dimensions ──────────────────────────────────────────────────────
-    parser.add_argument(
-        "--num-frames",
-        type=int,
-        default=81,
-        help="Frames to generate. Must be on the 4k+1 grid (81, 121, 161, …).",
-    )
-    parser.add_argument("--height", type=int, default=480, help="Frame height (px).")
-    parser.add_argument("--width", type=int, default=832, help="Frame width (px).")
-
-    # ── Sampling ──────────────────────────────────────────────────────────────
-    parser.add_argument("--steps", type=int, default=40, help="Denoising steps.")
-    parser.add_argument("--guidance", type=float, default=5.0, help="CFG scale.")
-    parser.add_argument("--seed", type=int, default=16, help="Random seed.")
-    parser.add_argument("--fps", type=int, default=16, help="Output FPS.")
+    # ── Wan-specific args NOT covered by the shared helpers ───────────────────
 
     # ── Loading ────────────────────────────────────────────────────────────────
     parser.add_argument(
@@ -111,49 +93,32 @@ def parse_args() -> argparse.Namespace:
         "across all visible GPUs. Useful to fit large models without CP.",
     )
 
-    # ── Output ────────────────────────────────────────────────────────────────
+    # ── LVSA wan-specific args ─────────────────────────────────────────────────
+    lvsa = parser._action_groups[-1]  # the LVSA group added by add_lvsa_args
+
+    # We need to add these to the parser directly (not to the group) to match
+    # the flat namespace, but add to a fresh group or the top-level parser.
+    # Use the top-level parser for the wan-specific LVSA args:
     parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=".",
-        help="Output directory for the generated video. Created if missing.",
+        "--cp-mode", choices=["custom", "ulysses", "ring"], default="custom",
+        help="Context-parallel attention mode (multi-GPU only). "
+             "'custom' (default) = all_reduce of global K/V + boundary guards "
+             "(no head-count constraint). 'ulysses' = all-to-all gather the full "
+             "sequence, run the single-device LVSA pattern (needs num_heads %% world "
+             "== 0; budget == single-GPU, no boundary-guard inflation). "
+             "'ring' = true ring rotation of K/V with the LVSA block-mask per step "
+             "(also no num_heads %% world constraint, unlike ulysses; compute-only "
+             "savings, O(world) comm).",
     )
     parser.add_argument(
-        "--output-name",
-        type=str,
+        "--reference-latent-frames",
+        type=int,
         default=None,
-        help="Output filename inside --output-dir. If omitted, a descriptive "
-        "name encoding model, geometry, backend, and run parameters is "
-        "auto-generated. Extension (.mp4) is appended automatically if missing.",
+        help="Override the model's training horizon in LATENT frames (the "
+        "adapter default is 21 for Wan2.1). Set 31 for Wan2.2-TI2V-5B (121 "
+        "frames / new 16x VAE) so its native 1x isn't mistaken for an extension.",
     )
-
-    # ── LVSA ───────────────────────────────────────────────────────────────────
-    lvsa = parser.add_argument_group(
-        "Sliding Window Attention (LVSA)",
-        "Block-sparse attention to reduce memory for long videos. "
-        "Add --lvsa to enable; all other LVSA flags are ignored otherwise.",
-    )
-    lvsa.add_argument(
-        "--lvsa",
-        action="store_true",
-        help="Enable WanDistributedLVSAProcessor (block-sparse attention).",
-    )
-
-    lvsa.add_argument(
-        "--window-size",
-        type=int,
-        default=12,
-        help="Half-width of the LVSA sliding window in *video* frames. "
-        "Converted to latent frames internally.",
-    )
-    lvsa.add_argument(
-        "--n-first-frames",
-        type=int,
-        default=4,
-        help="Number of leading video frames always included as global context. "
-        "Converted to latent frames internally.",
-    )
-    lvsa.add_argument(
+    parser.add_argument(
         "--key-frame-interval",
         type=int,
         default=16,
@@ -162,68 +127,7 @@ def parse_args() -> argparse.Namespace:
         "Converted to latent frames internally; auto-adjusted if too small. "
         "Ignored when --auto-keyframes is set.",
     )
-    lvsa.add_argument(
-        "--sparsity-scale",
-        type=float,
-        default=1.0,
-        help="Scale factor for the attention sparsity budget. "
-        "<1.0 makes attention more sparse (fewer attended frames), "
-        ">1.0 makes it less sparse (more attended frames). "
-        "Default 1.0 preserves the original behaviour.",
-    )
-    lvsa.add_argument(
-        "--reference-latent-frames",
-        type=int,
-        default=None,
-        help="Override the model's training horizon in LATENT frames (the "
-        "adapter default is 21 for Wan2.1). Set 31 for Wan2.2-TI2V-5B (121 "
-        "frames / new 16x VAE) so its native 1x isn't mistaken for an extension.",
-    )
-    lvsa.add_argument(
-        "--auto-keyframes",
-        action="store_true",
-        help="Automatically compute key-frame-interval so that total attended "
-        "frames per query approximates 21 (the reference budget). "
-        "Overrides --key-frame-interval.",
-    )
-    lvsa.add_argument(
-        "--flashinfer",
-        action="store_true",
-        help="Use FlashInfer BlockSparseAttentionWrapper for LVSA instead of "
-        "per-frame SDPA. Requires flashinfer to be installed.",
-    )
-    lvsa.add_argument(
-        "--cp-mode", choices=["custom", "ulysses"], default="custom",
-        help="Context-parallel attention mode (multi-GPU only). "
-             "'custom' (default) = all_reduce of global K/V + boundary guards "
-             "(no head-count constraint). 'ulysses' = all-to-all gather the full "
-             "sequence, run the single-device LVSA pattern (needs num_heads %% world "
-             "== 0; budget == single-GPU, no boundary-guard inflation).",
-    )
-    lvsa.add_argument(
-        "--show-mask",
-        action="store_true",
-        help="Print the T×T attention mask matrix showing which latent frames "
-        "each query frame attends to (G=global, W=window, X=both). "
-        "Useful for debugging LVSA patterns. Requires --lvsa.",
-    )
-    lvsa.add_argument(
-        "--show-mask-compact",
-        nargs="?",
-        const="once",
-        default=None,
-        choices=["once", "step"],
-        help="Compact 1-char-per-column attention mask. "
-        "'once' (default if flag given alone) prints at init. "
-        "'step' prints at every denoising step (useful with --rotate-keyframes).",
-    )
-    lvsa.add_argument(
-        "--rotate-keyframes",
-        action="store_true",
-        help="Shift periodic keyframes by 1 position each denoising step, "
-        "cycling through all positions over key_frame_interval steps. "
-        "This ensures every frame acts as a global anchor at some point.",
-    )
+
     # ── RIFLEx (training-free length extrapolation via RoPE) ──────────────────
     riflex = parser.add_argument_group(
         "RIFLEx (arXiv 2502.15894)",
@@ -258,14 +162,11 @@ def parse_args() -> argparse.Namespace:
         "reference (21 for Wan 1.3B).",
     )
 
-    # ── Profiling ─────────────────────────────────────────────────────────────
-    parser.add_argument(
-        "--profile",
-        action="store_true",
-        help="Log per-step wall-clock timing for profiling attention phases.",
-    )
+    return parser
 
-    return parser.parse_args()
+
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -276,31 +177,13 @@ def main() -> None:
 
     # ── Distributed vs single-GPU detection ────────────────────────────────────
     from lvsa.device import (
-        enable_fast_matmul,
-        get_device,
-        get_distributed_backend,
         max_memory_allocated,
         device_count,
         mem_get_info,
     )
 
-    distributed = "RANK" in os.environ
-    if distributed:
-        dist.init_process_group(get_distributed_backend())
-        rank = dist.get_rank()
-        world = dist.get_world_size()
-    else:
-        rank = 0
-        world = 1
-
-    device = get_device(rank)
-
-    os.environ["HF_ENABLE_PARALLEL_LOADING"] = "YES"
-    enable_fast_matmul()
-
-    if rank == 0:
-        mode = f"distributed (world_size={world})" if distributed else "single-GPU"
-        print(f"[init] {mode}  device={device}")
+    ctx = resolve_distributed()
+    rank, world, device, distributed = ctx.rank, ctx.world, ctx.device, ctx.distributed
 
     # ── Create model adapter ─────────────────────────────────────────────────
     adapter = WanAdapter()
@@ -397,13 +280,9 @@ def main() -> None:
 
     # ── Context-parallel plan (multi-GPU only) ────────────────────────────────
     if world > 1:
-        setup_context_parallel(adapter, pipe.transformer, world)
-        # Wan2.2-A14B dual-expert: transformer_2 needs its own CP plan or its
-        # (low-noise) steps compute the full sequence replicated on every rank.
-        if getattr(pipe, "transformer_2", None) is not None:
-            setup_context_parallel(adapter, pipe.transformer_2, world)
-            if rank == 0:
-                print("[LVSA] context-parallel enabled on transformer_2 (dual-expert)")
+        setup_cp(adapter, pipe, world)
+        if rank == 0 and getattr(pipe, "transformer_2", None) is not None:
+            print("[LVSA] context-parallel enabled on transformer_2 (dual-expert)")
 
     if rank == 0:
         print(f"[model] loaded in {time.time() - t0:.1f}s")
@@ -420,62 +299,7 @@ def main() -> None:
     t_gen = time.time()
 
     # ── Step callback for rotating keyframes / mask display / profiling
-    step_callback = None
-
-    need_callback = (
-        (lvsa_processor and args.rotate_keyframes)
-        or (lvsa_processor and args.show_mask_compact == "step")
-        or args.profile
-        or os.environ.get("LVSA_STEP_TIME_LOG", "0") == "1"
-        or os.environ.get("LVSA_MEM_LOG", "0") == "1"
-    )
-
-    if need_callback:
-        if rank == 0 and lvsa_processor:
-            print("[LVSA] windowed attention for all steps")
-
-        _step_times: list = []
-
-        def step_callback(pipe_obj, step_index, timestep, callback_kwargs):
-            if lvsa_processor is not None:
-                if args.rotate_keyframes:
-                    lvsa_processor.set_step(step_index)
-
-                if rank == 0 and args.show_mask_compact == "step":
-                    print(f"\n[LVSA-WINDOW] step {step_index}:")
-                    lvsa_processor.print_attention_mask_compact()
-
-            if args.profile and rank == 0:
-                now = time.time()
-                _step_times.append(now)
-                if len(_step_times) > 1:
-                    dt = now - _step_times[-2]
-                    print(f"[profile] step {step_index}: {dt:.3f}s")
-
-            # Opt-in per-step wall-clock log (LVSA_STEP_TIME_LOG=1). Emits the
-            # same [LVSA-TIME] format as the vllm-omni plugin paths so the
-            # plot script can consume either output uniformly.
-            if rank == 0 and os.environ.get("LVSA_STEP_TIME_LOG", "0") == "1":
-                import time as _time
-                _now = _time.perf_counter()
-                _last = getattr(step_callback, "_last_t", None)
-                if _last is not None:
-                    print(f"[LVSA-TIME] step={step_index - 1} dt={_now - _last:.3f}s", flush=True)
-                step_callback._last_t = _now  # type: ignore[attr-defined]
-
-            # Opt-in per-step memory log (LVSA_MEM_LOG=1, device-agnostic).
-            if rank == 0 and os.environ.get("LVSA_MEM_LOG", "0") == "1":
-                from lvsa.device import memory_stats
-                _stats = memory_stats()
-                if _stats is not None:
-                    _kind, _dev, _alloc, _reserved, _peak = _stats
-                    print(
-                        f"[LVSA-MEM] step={step_index} {_kind}={_dev} "
-                        f"alloc={_alloc:.2f}GB reserved={_reserved:.2f}GB peak={_peak:.2f}GB",
-                        flush=True,
-                    )
-
-            return callback_kwargs
+    step_callback = make_step_callback(args, lvsa_processor, rank)
 
     output = pipe(
         prompt=args.prompt,
@@ -505,39 +329,8 @@ def main() -> None:
             )
         else:
             mem_mb = max_memory_allocated() / 1024**2
-        if args.lvsa:
-            backend = "flashinfer" if args.flashinfer else "sdpa"
-            kfi_tag = "auto" if args.auto_keyframes else str(args.key_frame_interval)
-            rot_tag = "_rot" if args.rotate_keyframes else ""
-            ring_tag = ""
-            lvsa_tag = (
-                f"_lvsa_w{args.window_size}_f{args.n_first_frames}"
-                f"_kfi{kfi_tag}{rot_tag}{ring_tag}_{backend}"
-            )
-        else:
-            lvsa_tag = "_fullatt"
-        if args.output_name:
-            filename = args.output_name
-            if not filename.endswith(".mp4"):
-                filename += ".mp4"
-        else:
-            stem = os.path.basename(__file__).split(".")[0]
-            model_tag = os.path.basename(args.model)
-            prompt_tag = args.prompt.replace(" ", "_")[:30]
-            filename = (
-                f"{stem}"
-                f"_{model_tag}"
-                f"_{'balanced' if args.balanced else f'gpu{world}'}"
-                f"_{args.height}x{args.width}@{args.fps}"
-                f"_frames{args.num_frames}"
-                f"{lvsa_tag}"
-                f"_steps{args.steps}_cfg{args.guidance}"
-                f"_seed{args.seed}"
-                f"_dur{gen_duration:.0f}s_mem{mem_mb:.0f}MB"
-                f"_{prompt_tag}"
-                f".mp4"
-            )
-        out_path = os.path.join(args.output_dir, filename)
+        out_path = build_output_path(args, world, gen_duration, mem_mb,
+                                     stem="wan_generate", ext="mp4")
         os.makedirs(args.output_dir, exist_ok=True)
 
         t_exp = time.time()
