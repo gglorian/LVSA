@@ -118,10 +118,12 @@ def test_install_swaps_all_layers():
             self.layers = nn.ModuleList([_Layer() for _ in range(n)])
 
     tf = _Transformer(5)
-    n = install_cosmos3_lvsa(tf, num_frames=189, height=720, width=1280)
-    assert n == 5
+    proc = install_cosmos3_lvsa(tf, num_frames=189, height=720, width=1280)
+    assert isinstance(proc, Cosmos3LVSAAttnProcessor)
+    assert hasattr(proc, "metadata")
     for layer in tf.layers:
         assert isinstance(layer.self_attn.processor, Cosmos3LVSAAttnProcessor)
+        assert layer.self_attn.processor is proc  # same shared instance
 
 
 def test_batched_input_raises_not_corrupts():
@@ -182,3 +184,137 @@ def test_gen_geometry_mismatch_raises():
     with pytest.raises(ValueError, match=r"T_lat\*P"):
         proc(attn=None, und_seq=und.unsqueeze(0), gen_seq=wrong.unsqueeze(0),
              rotary_emb=None)
+
+
+def test_cosmos_generate_has_no_hardcoded_cuda():
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parents[1] / "examples" / "cosmos_generate.py"
+    text = src.read_text()
+    assert 'torch.cuda.max_memory_allocated' not in text
+    assert 'torch.cuda.reset_peak_memory_stats' not in text
+    assert 'Generator("cuda")' not in text and "Generator('cuda')" not in text
+    assert '.to("cuda")' not in text and ".to('cuda')" not in text
+    assert "from lvsa.device import" in text and "get_device" in text
+
+
+def test_cosmos_processor_print_mask(capsys):
+    from lvsa.cosmos3 import Cosmos3LVSAAttnProcessor
+    proc = Cosmos3LVSAAttnProcessor(total_latent_frames=32, num_patches=4,
+                                    reference_latent_frames=21, window_size=4,
+                                    n_first_frames=4, sparsity_scale=1.0)
+    proc.print_attention_mask_compact()
+    assert capsys.readouterr().out.strip() != ""
+
+
+def test_cosmos_processor_set_step_rotates():
+    from lvsa.cosmos3 import Cosmos3LVSAAttnProcessor
+    from lvsa.sparse_attention import LVSAMetadata
+    proc = Cosmos3LVSAAttnProcessor(total_latent_frames=32, num_patches=4,
+                                    reference_latent_frames=21, window_size=4,
+                                    n_first_frames=4, sparsity_scale=1.0)
+    base = list(proc.metadata.global_indices)
+    proc.set_step(0)
+    assert list(proc.metadata.global_indices) == base            # offset 0 == base
+    proc.set_step(1)
+    if proc.key_frame_interval:                                  # deterministic vs a direct build
+        off = 1 % proc.key_frame_interval
+        ref = LVSAMetadata.build(
+            total_latent_frames=32, num_patches=4, window_size=proc.window_lat,
+            n_first_frames=proc.n_first_lat, key_frame_interval=proc.key_frame_interval,
+            rank=0, world=1, expand_window=True, keyframe_offset=off,
+            reference_frames=21, sparsity_scale=1.0).global_indices
+        assert list(proc.metadata.global_indices) == list(ref)
+    proc.set_step(0)
+    assert list(proc.metadata.global_indices) == base            # round-trips back
+
+
+def test_cosmos_dualstream_runner_importable():
+    from lvsa.cosmos_flashinfer import Cosmos3DualStreamRunner, get_shared_runner
+    r = Cosmos3DualStreamRunner()            # constructs without CUDA
+    assert hasattr(r, "run") and callable(r.run)
+    s1 = get_shared_runner(); s2 = get_shared_runner()
+    assert s1 is s2                          # process-wide singleton
+
+
+def test_cosmos_processor_use_flashinfer_flag():
+    from lvsa.cosmos3 import Cosmos3LVSAAttnProcessor
+    from lvsa.cosmos_flashinfer import FLASHINFER_AVAILABLE
+    proc = Cosmos3LVSAAttnProcessor(total_latent_frames=32, num_patches=4,
+                                    reference_latent_frames=21, window_size=4,
+                                    n_first_frames=4, sparsity_scale=1.0,
+                                    use_flashinfer=True)
+    # honored only when flashinfer is importable; otherwise gracefully False
+    assert proc.use_flashinfer == bool(FLASHINFER_AVAILABLE)
+    proc2 = Cosmos3LVSAAttnProcessor(total_latent_frames=32, num_patches=4,
+                                     reference_latent_frames=21, window_size=4,
+                                     n_first_frames=4, sparsity_scale=1.0)
+    assert proc2.use_flashinfer is False    # default = SDPA
+
+
+import pytest
+import torch
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer needs CUDA")
+def test_cosmos_fused_matches_sdpa():
+    from lvsa.sparse_attention import LVSAMetadata, lvsa_sdpa, build_global_kv, compute_auto_kfi
+    from lvsa.cosmos_flashinfer import get_shared_runner, FLASHINFER_AVAILABLE
+    if not FLASHINFER_AVAILABLE:
+        pytest.skip("flashinfer not installed")
+    torch.manual_seed(0)
+    T, P, H, Hkv, D = 16, 64, 8, 8, 64
+    dev, dt = "cuda", torch.bfloat16
+    kfi = compute_auto_kfi(T, 2, 1, reference_frames=21, sparsity_scale=1.0)
+    md = LVSAMetadata.build(total_latent_frames=T, num_patches=P, window_size=2,
+                            n_first_frames=1, key_frame_interval=kfi, rank=0, world=1,
+                            expand_window=True, reference_frames=21, sparsity_scale=1.0)
+    S_gen = T * P
+    S_und = 37  # ragged und length (NOT a multiple of P) — the case that motivates the runner
+    qg = torch.randn(1, S_gen, H, D, device=dev, dtype=dt)
+    kg = torch.randn(1, S_gen, Hkv, D, device=dev, dtype=dt)
+    vg = torch.randn(1, S_gen, Hkv, D, device=dev, dtype=dt)
+    k_und = torch.randn(1, S_und, Hkv, D, device=dev, dtype=dt)
+    v_und = torch.randn(1, S_und, Hkv, D, device=dev, dtype=dt)
+    kglob, vglob = build_global_kv(kg, vg, md.global_indices, P)
+    kglob = torch.cat([kglob, k_und], dim=1); vglob = torch.cat([vglob, v_und], dim=1)
+    out_sdpa = lvsa_sdpa(qg, kg, vg, kglob, vglob, md).float()
+    out_fi = get_shared_runner().run(qg, kg, vg, kglob, vglob, md).float()
+    max_diff = (out_sdpa - out_fi).abs().max().item()
+    assert max_diff < 2e-2, f"fused vs SDPA max abs diff {max_diff}"
+
+
+def test_cosmos_processor_explicit_kfi():
+    from lvsa.cosmos3 import Cosmos3LVSAAttnProcessor
+    proc = Cosmos3LVSAAttnProcessor(total_latent_frames=32, num_patches=4,
+                                    reference_latent_frames=21, window_size=4,
+                                    n_first_frames=4, sparsity_scale=1.0,
+                                    key_frame_interval=5)
+    assert proc.key_frame_interval == 5      # explicit override honored
+
+
+def test_cosmos_new_flags_present():
+    from examples import cosmos_generate
+    flags = {a.option_strings[0] for a in cosmos_generate.build_parser()._actions if a.option_strings}
+    for f in ["--flashinfer", "--auto-keyframes", "--key-frame-interval",
+              "--reference-latent-frames", "--negative-prompt", "--profile",
+              "--show-mask", "--show-mask-compact", "--rotate-keyframes"]:
+        assert f in flags, f"missing {f}"
+
+
+def test_cosmos_processor_expand_window_param():
+    from lvsa.cosmos3 import Cosmos3LVSAAttnProcessor
+    p_exp = Cosmos3LVSAAttnProcessor(total_latent_frames=32, num_patches=4,
+                                     reference_latent_frames=21, window_size=4,
+                                     n_first_frames=4, sparsity_scale=1.0)            # default
+    assert p_exp._expand_window is True
+    p_ada = Cosmos3LVSAAttnProcessor(total_latent_frames=32, num_patches=4,
+                                     reference_latent_frames=21, window_size=4,
+                                     n_first_frames=4, sparsity_scale=1.0,
+                                     expand_window=False)
+    assert p_ada._expand_window is False
+
+
+def test_cosmos_no_expand_window_flag():
+    from examples import cosmos_generate
+    flags = {a.option_strings[0] for a in cosmos_generate.build_parser()._actions if a.option_strings}
+    assert "--no-expand-window" in flags
