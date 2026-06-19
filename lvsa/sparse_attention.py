@@ -216,6 +216,94 @@ def compute_global_indices(
     return sorted(global_set)
 
 
+def ring_block_frame_mask(
+    q_frames,
+    k_frames,
+    num_patches: int,
+    window_size: int,
+    total_frames: int,
+    global_set: Set[int],
+    expand_window: bool = True,
+) -> Optional[torch.Tensor]:
+    """Token-level bool mask ``[len(q_frames)*P, len(k_frames)*P]`` for one ring
+    block-pair, matching the single-device LVSA (global ∪ window) pattern.
+
+    A query frame ``f`` attends to a key frame ``k`` when either:
+      * ``k`` is a global anchor (``k in global_set``), or
+      * ``k`` lies inside ``f``'s window as computed by ``get_window_bounds``
+        (the *same* expanded/adaptive rule the single-device metadata uses).
+
+    This deliberately consumes the resolved ``global_set`` (which already folds
+    in ``n_first_frames`` ∪ periodic keyframes ∪ rotation offset ∪ boundary
+    guards) and ``get_window_bounds`` rather than re-deriving ``f % kfi``, so a
+    world=1 ring is bit-identical to the single-device pattern by construction.
+
+    Parameters
+    ----------
+    q_frames / k_frames : iterables of absolute frame indices owned by this
+        rank's Q block and the currently-held K block.
+    num_patches : tokens per latent frame (P).
+    window_size : sliding-window half-width W.
+    total_frames : T (needed by ``get_window_bounds``).
+    global_set : the resolved global anchor frame set (mirror the metadata's).
+    expand_window : honor expanded vs. adaptive window math.
+
+    Returns
+    -------
+    A ``[len(q_frames)*P, len(k_frames)*P]`` bool tensor (True = attend), or
+    ``None`` when the block-pair is entirely empty (the caller skips it — the
+    compute-skip win).
+    """
+    qf = list(q_frames)
+    kf = list(k_frames)
+    P = num_patches
+    global_count = len(global_set)
+
+    fm = torch.zeros(len(qf), len(kf), dtype=torch.bool)
+    for i, q in enumerate(qf):
+        win_lo, win_hi = get_window_bounds(
+            q, window_size, total_frames, expand_window, global_set, global_count,
+        )
+        for j, k in enumerate(kf):
+            if k in global_set or (win_lo <= k <= win_hi):
+                fm[i, j] = True
+    if not fm.any():
+        return None
+    return fm.repeat_interleave(P, dim=0).repeat_interleave(P, dim=1)
+
+
+def ring_block_frame_csr(q_frames, k_frames, window_size, total_frames,
+                         global_set, expand_window=True):
+    """Frame-level CSR ``(indptr, indices)`` for one ring block-pair — which
+    k-frames (block-cols) each q-frame (block-row) attends, by the SAME rule as
+    ``ring_block_frame_mask`` (global ∪ window). For the flashinfer
+    ``BlockSparseAttentionWrapper`` (R=C=P): it skips the non-listed frame-blocks,
+    so NO dense ``[Sq,Sk]`` mask is built (the ~1 GB bottleneck).
+
+    ``indices`` are LOCAL column indices into ``k_frames`` (0..len(k_frames)-1).
+    Returns ``(indptr int32 [len(qf)+1], indices int32 [nnz])`` or ``None`` when
+    the block-pair is entirely empty (caller skips it).
+    """
+    import torch
+    qf = list(q_frames)
+    kf = list(k_frames)
+    gc = len(global_set)
+    indptr = [0]
+    indices = []
+    for q in qf:
+        win_lo, win_hi = get_window_bounds(
+            q, window_size, total_frames, expand_window, global_set, gc,
+        )
+        for j, k in enumerate(kf):
+            if k in global_set or (win_lo <= k <= win_hi):
+                indices.append(j)
+        indptr.append(len(indices))
+    if not indices:
+        return None
+    return (torch.tensor(indptr, dtype=torch.int32),
+            torch.tensor(indices, dtype=torch.int32))
+
+
 def build_global_kv(
     key: torch.Tensor,
     value: torch.Tensor,

@@ -56,9 +56,13 @@ def install_lvsa_processors(
     construct a DistributedLVSAProcessor, and install it on every
     transformer block's self-attention layer.
 
-    All blocks share the same processor instance.  This is safe because the
-    processor is stateless between calls (no mutable state written during
-    forward — all local variables are stack-allocated inside __call__).
+    All blocks share the same processor instance.  This is safe because any
+    state the processor caches during forward (the ``cp_mode='ring'``
+    per-block-pair mask/CSR caches) is GEOMETRY-determined — identical across
+    every block, and across Wan2.2-A14B's two experts, which share that geometry
+    and never run concurrently (timestep-switched; the cache also clears per step
+    on keyframe rotation).  Sharing is in fact what makes the caching pay off:
+    build the mask/CSR once, reuse it across all blocks.
 
     Parameters are converted from video-frame space to latent-frame space
     using the adapter's geometry methods.
@@ -136,6 +140,7 @@ def install_lvsa_processors(
         rank=rank,
         world=world,
         cp_mode=getattr(args, "cp_mode", "custom"),
+        expand_window=getattr(args, "expand_window", True),
         adapter=adapter,
         sparsity_scale=sparsity_scale,
         reference_frames=ref_lat_frames,

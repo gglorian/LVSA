@@ -1102,3 +1102,178 @@ def test_ulysses_flashinfer_equals_custom_flashinfer_with_encoder_world1():
 
     assert torch.equal(out_uly, out_custom), \
         "ulysses-flashinfer world=1 (dual-stream) must equal custom-flashinfer"
+
+
+# ── __call__ tests via mock adapter ──────────────────────────────────────────
+
+import types
+from lvsa.adapters.base import ModelAdapter
+
+
+class _MinimalAdapter(ModelAdapter):
+    """Minimal mock adapter for testing __call__ without a real model.
+
+    hidden_states is [B, S, C] with C = H * D.  extract_qkv reshapes into
+    [B, S, H, D] per head; output_projection flattens back to [B, S, C].
+    """
+
+    H = 2
+    D = 8
+
+    # ── Geometry (stubs — not called by __call__) ─────────────────────────────
+
+    def patches_per_frame(self, height, width, pipe):
+        return 0
+
+    def latent_frames(self, num_frames, pipe):
+        return 0
+
+    def reference_latent_frames(self, pipe):
+        return 0
+
+    def install_processor(self, pipe, processor):
+        return 0
+
+    def setup_context_parallel(self, transformer, world):
+        pass
+
+    def patch_rotary_for_cp(self, rank, world):
+        pass
+
+    def extract_cross_attn_kv(self, attn, encoder_hidden_states):
+        return None
+
+    # ── Called by __call__ ────────────────────────────────────────────────────
+
+    def extract_qkv(self, attn, hidden_states, encoder_hidden_states):
+        """[B, S, C] -> three [B, S, H, D] tensors."""
+        B, S, C = hidden_states.shape
+        # C must equal H * D
+        qkv = hidden_states.reshape(B, S, self.H, self.D)
+        return qkv.clone(), qkv.clone(), qkv.clone()
+
+    def apply_rotary(self, query, key, rotary_emb, local_seq, rank, world):
+        return query, key
+
+    def split_encoder_for_cross_attn(self, attn, encoder_hidden_states):
+        return encoder_hidden_states, None
+
+    def cross_attention(self, attn, query, encoder_image, attention_backend):
+        return None
+
+    def output_projection(self, attn, hidden_states, query_dtype):
+        """[B, S, H, D] -> [B, S, H*D]."""
+        B, S, H, D = hidden_states.shape
+        return hidden_states.reshape(B, S, H * D).to(query_dtype)
+
+
+def _make_call_processor(T=8, P=4, W=2, n_first=1, kfi=2, rank=0, world=1):
+    """Build a processor with a mock adapter injected."""
+    proc = WanDistributedLVSAProcessor(
+        total_num_latent_frames=T,
+        num_patches=P,
+        window_size=W,
+        n_first_frames=n_first,
+        key_frame_interval=kfi,
+        rank=rank,
+        world=world,
+    )
+    proc.adapter = _MinimalAdapter()
+    return proc
+
+
+class TestCallSingleDevice:
+    """Tests for __call__ branches reachable on CPU (world=1, no encoder)."""
+
+    def test_call_single_device_lvsa(self):
+        """Happy path: geometry OK, world=1 → LVSA SDPA runs, output shape is correct."""
+        T, P, H, D = 8, 4, _MinimalAdapter.H, _MinimalAdapter.D
+        C = H * D
+        proc = _make_call_processor(T=T, P=P)
+        hidden_states = torch.randn(1, T * P, C)
+        attn = types.SimpleNamespace()
+
+        out = proc(attn, hidden_states, encoder_hidden_states=None, rotary_emb=None)
+
+        assert out.shape == (1, T * P, C), f"expected (1, {T*P}, {C}), got {out.shape}"
+
+    def test_call_dense_fallback_on_geometry_mismatch(self):
+        """Geometry mismatch (extra tokens) → dense fallback runs without error."""
+        T, P, H, D = 8, 4, _MinimalAdapter.H, _MinimalAdapter.D
+        C = H * D
+        proc = _make_call_processor(T=T, P=P)
+        # Extra tokens cause geometry mismatch (T*P + 7 ≠ T*P)
+        S_bad = T * P + 7
+        hidden_states = torch.randn(1, S_bad, C)
+        attn = types.SimpleNamespace()
+
+        out = proc(attn, hidden_states, encoder_hidden_states=None, rotary_emb=None)
+
+        assert out.shape == (1, S_bad, C), f"expected (1, {S_bad}, {C}), got {out.shape}"
+
+    def test_call_cp_geometry_mismatch_raises(self):
+        """world=2 + geometry mismatch → NotImplementedError (CP dense fallback unsupported)."""
+        # T=8, P=4, world=2 → expected local_seq = 8*4//2 = 16
+        # Feed 8*4=32 tokens (full seq instead of shard) → mismatch
+        T, P, H, D = 8, 4, _MinimalAdapter.H, _MinimalAdapter.D
+        C = H * D
+        proc = _make_call_processor(T=T, P=P, world=2, rank=0)
+        # Feed T*P tokens; the world=2 proc expects T*P//world = 16 per rank
+        hidden_states = torch.randn(1, T * P, C)  # 32 != 16 → mismatch
+        attn = types.SimpleNamespace()
+
+        with pytest.raises(NotImplementedError, match="geometry mismatch"):
+            proc(attn, hidden_states, encoder_hidden_states=None, rotary_emb=None)
+
+
+# ── GQA-safe FlashInfer plan (GPU-gated parity) ───────────────────────────────
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer needs CUDA")
+def test_processor_flashinfer_gqa_matches_sdpa():
+    """The processor's FlashInfer block-sparse path must match SDPA under GQA
+    (num_kv_heads < num_heads). Before the fix the plan was built with
+    num_kv_heads=H and the compact KV buffer allocated at width H, so a GQA
+    layout (here H=8 query heads, H_kv=2 KV heads) either errors in plan() or
+    silently produces wrong numerics. Mirrors
+    tests/test_cosmos3_processor.py::test_cosmos_fused_matches_sdpa but drives
+    the processor's own FlashInfer entry (_compute_lvsa_flashinfer)."""
+    from lvsa.sparse_attention import (
+        LVSAMetadata, lvsa_sdpa, build_global_kv, compute_auto_kfi,
+    )
+    try:
+        import flashinfer  # noqa: F401
+    except Exception:
+        pytest.skip("flashinfer not installed")
+
+    torch.manual_seed(0)
+    T, P, H, H_kv, D = 16, 64, 8, 2, 64        # GQA: 8 query heads, 2 KV heads
+    dev, dt = "cuda", torch.bfloat16
+
+    proc = WanDistributedLVSAProcessor(
+        total_num_latent_frames=T,
+        num_patches=P,
+        window_size=2,
+        n_first_frames=1,
+        key_frame_interval=compute_auto_kfi(
+            T, 2, 1, reference_frames=21, sparsity_scale=1.0,
+        ),
+        rank=0,
+        world=1,
+    )
+    proc._use_flashinfer = True
+    md = proc._metadata
+
+    S_gen = T * P
+    qg = torch.randn(1, S_gen, H, D, device=dev, dtype=dt)
+    kg = torch.randn(1, S_gen, H_kv, D, device=dev, dtype=dt)
+    vg = torch.randn(1, S_gen, H_kv, D, device=dev, dtype=dt)
+    kglob, vglob = build_global_kv(kg, vg, md.global_indices, P)
+
+    out_sdpa = lvsa_sdpa(qg, kg, vg, kglob, vglob, md).float()
+    out_fi = proc._compute_lvsa_flashinfer(
+        qg, kg, vg, kglob, vglob, md, proc._fi,
+    ).float()
+
+    max_diff = (out_sdpa - out_fi).abs().max().item()
+    assert max_diff < 2e-2, f"processor FlashInfer vs SDPA max abs diff {max_diff}"
