@@ -293,6 +293,7 @@ def test_cosmos_processor_explicit_kfi():
 
 
 def test_cosmos_new_flags_present():
+    pytest.importorskip("diffusers.models.transformers.transformer_cosmos3")
     from examples import cosmos_generate
     flags = {a.option_strings[0] for a in cosmos_generate.build_parser()._actions if a.option_strings}
     for f in ["--flashinfer", "--auto-keyframes", "--key-frame-interval",
@@ -315,6 +316,7 @@ def test_cosmos_processor_expand_window_param():
 
 
 def test_cosmos_no_expand_window_flag():
+    pytest.importorskip("diffusers.models.transformers.transformer_cosmos3")
     from examples import cosmos_generate
     flags = {a.option_strings[0] for a in cosmos_generate.build_parser()._actions if a.option_strings}
     assert "--no-expand-window" in flags

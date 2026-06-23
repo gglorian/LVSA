@@ -1124,6 +1124,13 @@ class DistributedLVSAProcessor:
         (``_compute_lvsa_ring_flashinfer``); this pure-torch path is the default
         and the CPU-tested correctness reference.
         """
+        device = query.device
+        if getattr(self, "_last_device", None) != device:
+            self._last_device = device
+            self._ring_mask_cache = {}
+            self._ring_fi_cache = {}
+            self._ring_workspaces = {}
+
         if self._use_flashinfer:
             return self._compute_lvsa_ring_flashinfer(
                 query, key, value, enc_k, enc_v,

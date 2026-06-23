@@ -83,7 +83,7 @@ class Cosmos3DualStreamRunner:
         """Plan the GEN-ONLY block-sparse CSR (no und block, no mask)."""
         indptr = metadata.fi_indptr.to(device)
         indices = metadata.fi_indices.to(device)
-        if self._workspace is None:
+        if self._workspace is None or self._workspace.device != device:
             self._workspace = torch.empty(
                 128 * 1024 * 1024, dtype=torch.uint8, device=device,
             )
@@ -165,7 +165,10 @@ class Cosmos3DualStreamRunner:
         # only because the copies below fully tile [0, compact_N) (asserted above).
         compact_N = metadata.fi_compact_n * P
         shape = (B, compact_N, Hkv, D)
-        if self._compact_k is None or self._compact_k.shape != shape:
+        if (self._compact_k is None
+                or self._compact_k.shape != shape
+                or self._compact_k.device != query.device
+                or self._compact_k.dtype != query.dtype):
             self._compact_k = query.new_zeros(*shape)
             self._compact_v = query.new_zeros(*shape)
         ck, cv = self._compact_k, self._compact_v
@@ -178,7 +181,10 @@ class Cosmos3DualStreamRunner:
 
         # ── q padding to M = MB*P (block-aligned) ──
         if local_seq < M:
-            if self._q_pad is None or self._q_pad.shape != (B, M, H, D):
+            if (self._q_pad is None
+                    or self._q_pad.shape != (B, M, H, D)
+                    or self._q_pad.device != query.device
+                    or self._q_pad.dtype != query.dtype):
                 self._q_pad = query.new_zeros(B, M, H, D)
             self._q_pad[:, :local_seq] = query
             q_pad = self._q_pad

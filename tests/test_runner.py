@@ -1,4 +1,5 @@
 import argparse
+import pytest
 from examples._runner import add_common_args, add_lvsa_args
 
 
@@ -222,6 +223,9 @@ def test_cosmos_flags_unchanged():
     # Cosmos is intentionally NOT rewired onto the shared helpers (it is the
     # outlier: single-GPU, required --output-name, Path output-dir, .video, no
     # per-step hook). This test guards its parser against accidental drift.
+    # cosmos_generate imports Cosmos3OmniPipeline (diffusers main only); skip on
+    # release diffusers (CI), where importing the module raises ImportError.
+    pytest.importorskip("diffusers.models.transformers.transformer_cosmos3")
     base = json.loads((pathlib.Path(__file__).parent / "_example_flags_baseline.json").read_text())
     from examples import cosmos_generate
     assert _parser_flags(cosmos_generate.build_parser) == base["cosmos"]

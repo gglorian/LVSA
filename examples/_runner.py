@@ -417,7 +417,7 @@ def build_output_path(args, world: int, gen_duration: float, mem_mb: float,
         else:
             lvsa_tag = "_fullatt"
         gpu_tag = "balanced" if getattr(args, "balanced", False) else f"gpu{world}"
-        model_tag = os.path.basename(args.model)
+        model_tag = os.path.basename(args.model.rstrip("/\\"))
         prompt_tag = args.prompt.replace(" ", "_")[:30]
         filename = (
             f"{stem}"
