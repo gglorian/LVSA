@@ -33,8 +33,11 @@ class HunyuanVideoAdapter(ModelAdapter):
 
     .. warning::
 
-        This adapter is experimental.  The 3D RoPE slicing for multi-GPU
-        context parallelism requires further work.
+        This adapter is experimental.  The dual-stream **text-query** branch
+        is now CP-correct (it gathers the full video K/V across ranks via
+        ``DistributedLVSAProcessor._compute_encoder_query_attention``; the
+        2026-06-18 fix for HV diverging from single-GPU under every cp_mode).
+        The production HV route is the vllm-omni plugin, not this standalone.
     """
 
     # ── Geometry ──────────────────────────────────────────────────────────────

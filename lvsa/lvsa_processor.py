@@ -80,6 +80,76 @@ def _ulysses_all_to_all(
     return torch.cat(out, dim=gather_dim).contiguous()
 
 
+# Query-chunk size for ``_attn_with_lse``. The score matrix is ``[B,H,q_tile,Sk]``
+# rather than the full ``[B,H,Sq,Sk]`` — at video scale Sq=Sk can be ~33k, so the
+# untiled matrix is ~48 GiB (OOM). Tiling caps it to ``O(q_tile × Sk)``. Queries
+# are independent, so per-tile (out, lse) just concatenate along Sq → exact.
+_RING_Q_TILE = 1024
+
+
+def _attn_with_lse(q, k, v, attn_mask=None, scale=None, q_tile=_RING_Q_TILE):
+    """Masked attention returning ``(output, log-sum-exp)`` — the online-softmax
+    primitive for the ring path.
+
+    q: ``[B, H, Sq, D]``; k/v: ``[B, H, Sk, D]`` (GQA: expand K/V to H first).
+    ``attn_mask``: optional bool ``[Sq, Sk]`` (True = attend). Rows that are
+    all-False yield ``lse = -inf`` and a zero output for that query, so an empty
+    block-pair contributes nothing under ``_merge_out_lse`` (callers may skip
+    such pairs entirely — see ``ring_block_frame_mask`` returning ``None``).
+
+    Computed in query tiles of ``q_tile`` to bound memory at video scale (the
+    untiled ``[Sq,Sk]`` scores OOM). Math is identical to the untiled form: each
+    query attends to all of ``k`` independently, so chunking Sq and concatenating
+    is exact. At small (test) sizes ``Sq <= q_tile`` → a single tile.
+
+    Returns ``out [B, H, Sq, D]``, ``lse [B, H, Sq]`` (both float32 for a stable
+    merge regardless of input dtype).
+    """
+    scale = scale if scale is not None else q.shape[-1] ** -0.5
+    B, H, Sq, D = q.shape
+    kt = k.float().transpose(-1, -2)                          # [B,H,D,Sk]
+    vf = v.float()
+    out = torch.empty((B, H, Sq, D), dtype=torch.float32, device=q.device)
+    lse = torch.empty((B, H, Sq), dtype=torch.float32, device=q.device)
+    for s in range(0, Sq, q_tile):
+        e = min(s + q_tile, Sq)
+        scores = (q[:, :, s:e, :].float() @ kt) * scale      # [B,H,tile,Sk]
+        if attn_mask is not None:
+            scores = scores.masked_fill(~attn_mask[s:e, :], float("-inf"))
+        l = torch.logsumexp(scores, dim=-1)                  # [B,H,tile]; -inf if all-masked
+        a = torch.nan_to_num(torch.exp(scores - l.unsqueeze(-1)), nan=0.0)
+        out[:, :, s:e, :] = a @ vf
+        lse[:, :, s:e] = l
+    return out, lse
+
+
+def _merge_out_lse(out_a, lse_a, out_b, lse_b):
+    """Online-softmax combine of two attention results over DISJOINT key sets.
+
+    First call: pass ``out_a=None`` (and ``lse_a`` is ignored) to initialize.
+    Handles ``-inf`` lse (empty block) via ``nan_to_num`` on the reweighted terms.
+    Returns ``(merged_out, merged_lse)``.
+    """
+    if out_a is None:
+        return out_b, lse_b
+    new_lse = torch.logaddexp(lse_a, lse_b)                   # [B,H,Sq]
+    a = torch.exp(lse_a - new_lse).unsqueeze(-1)
+    b = torch.exp(lse_b - new_lse).unsqueeze(-1)
+    merged = torch.nan_to_num(out_a * a, nan=0.0) + torch.nan_to_num(out_b * b, nan=0.0)
+    return merged, new_lse
+
+
+def _all_gather_seq(x, world):
+    """All-gather a per-rank sequence shard ``[B, local_seq, H, D]`` into the full
+    ``[B, full_seq, H, D]`` on every rank. CP shards the sequence contiguously
+    (rank r owns frames ``[r·T/world, (r+1)·T/world)``), so the rank-ordered
+    concatenation reconstructs the original sequence order.
+    """
+    gathered = [torch.empty_like(x) for _ in range(world)]
+    dist.all_gather(gathered, x.contiguous())
+    return torch.cat(gathered, dim=1)
+
+
 class _FIState:
     """Mutable runtime caches for one FlashInfer block-sparse plan.
 
@@ -166,9 +236,9 @@ class DistributedLVSAProcessor:
         self.n_first_frames = n_first_frames
         self.rank = rank
         self.world = world
-        if cp_mode not in ("custom", "ulysses"):
+        if cp_mode not in ("custom", "ulysses", "ring"):
             raise ValueError(
-                f"cp_mode must be 'custom' or 'ulysses', got {cp_mode!r}"
+                f"cp_mode must be 'custom', 'ulysses', or 'ring', got {cp_mode!r}"
             )
         self._cp_mode = cp_mode
         self._num_patches = num_patches
@@ -227,6 +297,39 @@ class DistributedLVSAProcessor:
                 reference_frames=reference_frames,
                 sparsity_scale=sparsity_scale,
             )
+
+        # Ring-CP metadata: like ulysses, the ring rotation reconstructs the
+        # single-device pattern (each query attends to the full global ∪ window
+        # set, just over rotating K/V blocks instead of a gathered grid). So the
+        # ring path reads the SINGLE-DEVICE global set (rank=0, world=1, no
+        # boundary guards) — boundary guards are a custom-mode seam fix that ring
+        # does not need (a global block is attended whenever it rotates past).
+        self._ring_metadata = None
+        if self._cp_mode == "ring":
+            self._ring_metadata = LVSAMetadata.build(
+                total_latent_frames=total_num_latent_frames,
+                num_patches=num_patches,
+                window_size=window_size,
+                n_first_frames=n_first_frames,
+                key_frame_interval=key_frame_interval,
+                rank=0,
+                world=1,
+                expand_window=expand_window,
+                keyframe_offset=0,
+                boundary_guards=[],
+                reference_frames=reference_frames,
+                sparsity_scale=sparsity_scale,
+            )
+
+        # ── Ring per-block-pair caches ──────────────────────────────────────
+        # The per-block-pair mask/CSR is identical across all ~N transformer
+        # layers within a denoising step, so build it ONCE and reuse — not ~N×.
+        # (Rebuilding the ~1 GB dense mask every layer was the real bottleneck,
+        # dwarfing even the fast flashinfer attention.) Cleared on keyframe
+        # rotation in ``_rebuild_for_current_params``. Benefits BOTH backends.
+        self._ring_mask_cache: dict = {}   # src -> GPU bool mask (or False if empty)
+        self._ring_fi_cache: dict = {}     # src -> flashinfer BlockSparse wrapper (or False)
+        self._ring_workspaces: dict = {}   # src -> persistent 128 MB flashinfer scratch
 
         # ── Cached buffers (reused across calls, avoids repeated allocation) ──
         self._kv_buf: Optional[torch.Tensor] = None
@@ -494,6 +597,24 @@ class DistributedLVSAProcessor:
                 sparsity_scale=self._sparsity_scale,
             )
 
+        # Keep the ring metadata's single-device global set in lockstep with the
+        # rotated pattern (same reasoning as ulysses above).
+        if self._cp_mode == "ring":
+            self._ring_metadata = LVSAMetadata.build(
+                total_latent_frames=self.total_num_frames,
+                num_patches=self.num_patches,
+                window_size=self.window_size,
+                n_first_frames=self.n_first_frames,
+                key_frame_interval=self.key_frame_interval,
+                rank=0,
+                world=1,
+                expand_window=self._expand_window,
+                keyframe_offset=offset,
+                boundary_guards=[],
+                reference_frames=self._reference_frames,
+                sparsity_scale=self._sparsity_scale,
+            )
+
         # Force re-upload of device tensors
         self._global_frame_mask_device = None
         self._window_bounds_device = None
@@ -505,6 +626,11 @@ class DistributedLVSAProcessor:
         # Reset FlashInfer state (both paths; keeps the workspace scratch)
         self._fi.reset()
         self._ufi.reset()
+
+        # Ring masks/CSRs depend on the (now-rebuilt) global_set → invalidate.
+        # Keep _ring_workspaces (persistent scratch; wrappers re-plan onto them).
+        self._ring_mask_cache = {}
+        self._ring_fi_cache = {}
 
     # ── Static helpers (delegators to sparse_attention module functions) ────────
 
@@ -636,6 +762,14 @@ class DistributedLVSAProcessor:
                 hidden_states = self._compute_lvsa_ulysses(
                     query, key, value, enc_k, enc_v,
                 )
+            elif self._cp_mode == "ring":
+                # ── Ring CP (sequence-sharded, true ring rotation) ───────────
+                # Rotate K/V around the ring, attend the local Q to each incoming
+                # block under the LVSA frame-mask, accumulate via online-softmax.
+                # No num_heads%world constraint (shards sequence, not heads).
+                hidden_states = self._compute_lvsa_ring(
+                    query, key, value, enc_k, enc_v,
+                )
             else:
                 # ── Custom CP (sequence-sharded, global-broadcast) ───────────
                 # Start global KV build — the all-reduce runs asynchronously so
@@ -694,12 +828,13 @@ class DistributedLVSAProcessor:
 
         # ── Dual-stream: encoder query full attention ────────────────────────
         # Encoder query tokens need full attention against all K/V (video + encoder).
+        # Under CP the video K/V must be the FULL grid, not the local shard
+        # (see _compute_encoder_query_attention).
         enc_output = None
         if enc_q is not None:
-            # Full attention: encoder queries attend to all video K/V + encoder K/V
-            full_k = torch.cat([key, enc_k], dim=1)
-            full_v = torch.cat([value, enc_v], dim=1)
-            enc_output = self._compute_full_attention(enc_q, full_k, full_v)
+            enc_output = self._compute_encoder_query_attention(
+                enc_q, enc_k, enc_v, key, value,
+            )
 
         # ── Cross-attention (model-specific, e.g. I2V image context) ─────────
         cross_out = adapter.cross_attention(
@@ -817,6 +952,25 @@ class DistributedLVSAProcessor:
         return self._kv_buf[0], self._kv_buf[1]
 
     # ── Full attention (for encoder queries in dual-stream) ────────────────────
+
+    def _compute_encoder_query_attention(self, enc_q, enc_k, enc_v, key, value):
+        """Dual-stream text-query attention: encoder (text) queries attend the
+        FULL video K/V plus the encoder K/V (one dense softmax — the text stream
+        of the joint attention, matching single-GPU).
+
+        Under context-parallelism the per-rank ``key``/``value`` are only the
+        LOCAL video shard, so the full video K/V is gathered across ranks first.
+        Without this, each rank's text-query output sees only ``1/world`` of the
+        video and diverges from single-GPU — the bug that broke HunyuanVideo CP
+        for EVERY cp_mode (the text stream then poisons every later block through
+        the joint attention). ``world == 1`` is a no-op (local shard == full).
+        """
+        if self.world > 1:
+            key = _all_gather_seq(key, self.world)
+            value = _all_gather_seq(value, self.world)
+        full_k = torch.cat([key, enc_k], dim=1)
+        full_v = torch.cat([value, enc_v], dim=1)
+        return self._compute_full_attention(enc_q, full_k, full_v)
 
     def _compute_full_attention(
         self,
@@ -939,11 +1093,228 @@ class DistributedLVSAProcessor:
             out = _ulysses_all_to_all(out, 1, 2, self.world)
         return out
 
+    # ── Ring block-sparse path ───────────────────────────────────────────────
+
+    def _compute_lvsa_ring(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        enc_k: Optional[torch.Tensor],
+        enc_v: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Variant-A ring LVSA: rotate K/V around the ring, attend the LOCAL Q to
+        each incoming block under the LVSA frame-mask, accumulate via online-
+        softmax (LSE merge).
+
+        Inputs are the per-rank shard ``[B, local_seq, H, D]``; returns the same
+        ``[B, local_seq, H, D]`` (output projection happens in ``__call__``,
+        identical to ``_compute_lvsa_ulysses``).
+
+        Globals are NOT broadcast separately — a global frame's K/V block is
+        attended whenever it rotates past this rank (the block-mask includes it),
+        so the rotation handles globals + window uniformly. ``world==1`` is a
+        single step (no rotation), proving the masked-block + LSE math equals the
+        single-device pattern before any comm is involved.
+
+        Ring shards SEQUENCE, not heads -> no ``num_heads % world`` constraint
+        (GQA ok: K/V are expanded to the H query heads for the masked matmul).
+
+        ``--flashinfer`` switches to the fused block-sparse-LSE kernel
+        (``_compute_lvsa_ring_flashinfer``); this pure-torch path is the default
+        and the CPU-tested correctness reference.
+        """
+        device = query.device
+        if getattr(self, "_last_device", None) != device:
+            self._last_device = device
+            self._ring_mask_cache = {}
+            self._ring_fi_cache = {}
+            self._ring_workspaces = {}
+
+        if self._use_flashinfer:
+            return self._compute_lvsa_ring_flashinfer(
+                query, key, value, enc_k, enc_v,
+            )
+
+        from .sparse_attention import ring_block_frame_mask
+
+        B, Sloc, H, D = query.shape
+        H_kv = key.shape[2]
+        P = self.num_patches
+        T = self.total_num_frames
+        assert T % self.world == 0, (
+            f"cp_mode='ring' needs total_frames ({T}) divisible by world "
+            f"({self.world}) for whole-frame blocks; use 'custom' otherwise."
+        )
+        Tloc = T // self.world
+
+        meta = self._ring_metadata
+        global_set = meta.global_set
+
+        # [B, H, S, D] layout for matmul; expand GQA K/V to H heads.
+        q = query.transpose(1, 2).contiguous()                # [B,H,Sloc,D]
+        k_cur = key.transpose(1, 2).contiguous()              # [B,H_kv,Sloc,D]
+        v_cur = value.transpose(1, 2).contiguous()
+        if H_kv != H:
+            rep = H // H_kv
+            k_cur = k_cur.repeat_interleave(rep, dim=1).contiguous()
+            v_cur = v_cur.repeat_interleave(rep, dim=1).contiguous()
+
+        q_frames = range(self.rank * Tloc, (self.rank + 1) * Tloc)
+        src = self.rank                                       # block currently held
+        out = lse = None
+        for step in range(self.world):
+            # Cached per ``src`` (built once per step, reused across layers).
+            mask = self._ring_mask_cache.get(src)
+            if mask is None:
+                m = ring_block_frame_mask(
+                    q_frames, range(src * Tloc, (src + 1) * Tloc),
+                    P, self.window_size, T, global_set, self._expand_window,
+                )
+                mask = m.to(q.device) if m is not None else False  # False = empty pair
+                self._ring_mask_cache[src] = mask
+            if mask is not False:                             # skip empty block-pairs
+                b_out, b_lse = _attn_with_lse(q, k_cur, v_cur, attn_mask=mask)
+                out, lse = _merge_out_lse(out, lse, b_out, b_lse)
+            if step < self.world - 1:
+                k_cur, v_cur, src = self._ring_rotate(k_cur, v_cur, src)
+
+        # Encoder/text K/V: every video Q attends to all text (a fixed global
+        # term), exactly as the custom/ulysses paths append enc to global K/V.
+        if enc_k is not None:
+            ek = enc_k.transpose(1, 2).contiguous()
+            ev = enc_v.transpose(1, 2).contiguous()
+            if ek.shape[1] != H:
+                rep = H // ek.shape[1]
+                ek = ek.repeat_interleave(rep, 1).contiguous()
+                ev = ev.repeat_interleave(rep, 1).contiguous()
+            e_out, e_lse = _attn_with_lse(q, ek, ev)          # full attention, no mask
+            out, lse = _merge_out_lse(out, lse, e_out, e_lse)
+
+        out = out.transpose(1, 2).contiguous().to(query.dtype)  # [B,Sloc,H,D]
+        return out
+
+    def _ring_rotate(self, k_cur, v_cur, src):
+        """Send the held K/V block to rank+1, receive the next block from rank-1.
+
+        Standard ring P2P (batched isend/irecv to avoid deadlock). Returns
+        ``(k_next, v_next, new_src)``; pure ring topology, O(world) total.
+        Only reached when ``world > 1``.
+        """
+        nxt = (self.rank + 1) % self.world
+        prv = (self.rank - 1) % self.world
+        k_send = k_cur.contiguous()
+        v_send = v_cur.contiguous()
+        k_next = torch.empty_like(k_send)
+        v_next = torch.empty_like(v_send)
+        ops = [
+            dist.P2POp(dist.isend, k_send, nxt),
+            dist.P2POp(dist.isend, v_send, nxt),
+            dist.P2POp(dist.irecv, k_next, prv),
+            dist.P2POp(dist.irecv, v_next, prv),
+        ]
+        for w in dist.batch_isend_irecv(ops):
+            w.wait()
+        return k_next, v_next, (src - 1) % self.world
+
+    def _compute_lvsa_ring_flashinfer(self, query, key, value, enc_k, enc_v):
+        """Fused flashinfer block-sparse-LSE ring (``--flashinfer``). Same
+        variant-A algorithm as the pure-torch ``_compute_lvsa_ring`` — rotate
+        K/V, attend the local Q to each block under the LVSA pattern, accumulate
+        via online-softmax — but each block-pair runs through a
+        ``flashinfer.BlockSparseAttentionWrapper`` over a per-block-pair frame
+        CSR (it SKIPS the non-attended frame-blocks: no dense ``[Sq,Sk]`` mask,
+        no compute on masked pairs), with blocks combined via flashinfer's native
+        ``merge_state``. The CSR + planned wrapper are CACHED per ``src`` (built
+        once per step, reused across the ~N transformer layers; cleared on
+        keyframe rotation). FlashInfer's layout ``[seq, H, D]`` == the input
+        layout (no transpose); GQA-native. CUDA-only; GPU-validated against the
+        CPU-tested pure-torch ring.
+        """
+        import flashinfer
+        from .sparse_attention import ring_block_frame_csr
+
+        B, Sloc, H, D = query.shape
+        H_kv = key.shape[2]
+        P = self.num_patches
+        T = self.total_num_frames
+        assert T % self.world == 0, (
+            f"cp_mode='ring' needs total_frames ({T}) divisible by world "
+            f"({self.world}); use 'custom' otherwise."
+        )
+        Tloc = T // self.world
+        global_set = self._ring_metadata.global_set
+        dt = {torch.float16: "float16", torch.bfloat16: "bfloat16",
+              torch.float32: "float32"}.get(query.dtype, "bfloat16")
+
+        k_cur = key.contiguous()
+        v_cur = value.contiguous()
+        src = self.rank
+        q_frames = range(self.rank * Tloc, (self.rank + 1) * Tloc)
+
+        acc_o = [None] * B            # per-batch flashinfer-layout accumulators
+        acc_l = [None] * B
+        for step in range(self.world):
+            wrapper = self._ring_fi_cache.get(src)
+            if wrapper is None:       # build CSR + plan once per (step, src)
+                csr = ring_block_frame_csr(
+                    q_frames, range(src * Tloc, (src + 1) * Tloc),
+                    self.window_size, T, global_set, self._expand_window,
+                )
+                if csr is None:
+                    wrapper = False                       # empty block-pair
+                else:
+                    ws = self._ring_workspaces.get(src)
+                    if ws is None:
+                        ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8,
+                                         device=query.device)
+                        self._ring_workspaces[src] = ws   # persistent scratch
+                    wrapper = flashinfer.BlockSparseAttentionWrapper(ws)
+                    wrapper.plan(
+                        indptr=csr[0].to(query.device),
+                        indices=csr[1].to(query.device),
+                        M=Sloc, N=Tloc * P, R=P, C=P,
+                        num_qo_heads=H, num_kv_heads=H_kv, head_dim=D,
+                        q_data_type=dt, kv_data_type=dt, o_data_type=dt,
+                    )
+                self._ring_fi_cache[src] = wrapper
+            if wrapper is not False:
+                for b in range(B):
+                    o, l = wrapper.run(
+                        query[b].contiguous(), k_cur[b].contiguous(),
+                        v_cur[b].contiguous(), return_lse=True,
+                    )
+                    if acc_o[b] is None:
+                        acc_o[b], acc_l[b] = o, l
+                    else:
+                        acc_o[b], acc_l[b] = flashinfer.merge_state(
+                            acc_o[b], acc_l[b], o, l)
+            if step < self.world - 1:
+                k_cur, v_cur, src = self._ring_rotate(k_cur, v_cur, src)
+
+        # Encoder/text term: gen Q attends ALL text (full, always-global).
+        if enc_k is not None:
+            for b in range(B):
+                o, l = flashinfer.single_prefill_with_kv_cache(
+                    query[b].contiguous(), enc_k[b].contiguous(),
+                    enc_v[b].contiguous(), causal=False, return_lse=True)
+                if acc_o[b] is None:
+                    acc_o[b], acc_l[b] = o, l
+                else:
+                    acc_o[b], acc_l[b] = flashinfer.merge_state(
+                        acc_o[b], acc_l[b], o, l)
+
+        out = query.new_empty((B, Sloc, H, D))
+        for b in range(B):
+            out[b] = acc_o[b].to(query.dtype)
+        return out
+
     # ── FlashInfer block-sparse path ─────────────────────────────────────────
 
     def _ensure_flashinfer_planned(
         self,
         query: torch.Tensor,
+        key: torch.Tensor,
         enc_tokens: int,
         meta: "LVSAMetadata",
         st: _FIState,
@@ -974,6 +1345,7 @@ class DistributedLVSAProcessor:
 
         device = query.device
         H = query.shape[2]
+        H_kv = key.shape[2]   # may be < H under GQA (num_kv_heads < num_heads)
         D = query.shape[3]
         P = self.num_patches
 
@@ -1003,7 +1375,7 @@ class DistributedLVSAProcessor:
             R=P,
             C=P,
             num_qo_heads=H,
-            num_kv_heads=H,
+            num_kv_heads=H_kv,
             head_dim=D,
             q_data_type=q_dtype_str,
             kv_data_type=q_dtype_str,
@@ -1039,6 +1411,7 @@ class DistributedLVSAProcessor:
         ``st``.
         """
         B, local_seq, H, D = query.shape
+        H_kv = key.shape[2]   # may be < H under GQA (num_kv_heads < num_heads)
         P = self.num_patches
         M = meta.fi_M
 
@@ -1047,10 +1420,15 @@ class DistributedLVSAProcessor:
         total_global_tokens = k_global.shape[1]
         enc_tokens = total_global_tokens - num_global_video_tokens
 
-        self._ensure_flashinfer_planned(query, enc_tokens, meta, st)
+        self._ensure_flashinfer_planned(query, key, enc_tokens, meta, st)
         # ── Gen-only compact KV buffer (encoder handled separately) ──
+        # Width is the K/V head count H_kv (== H for MHA), NOT the query head
+        # count: under GQA (H_kv < H) the compact buffer mirrors the GQA K/V
+        # layout and the plan's num_kv_heads — no repeat-KV here (FlashInfer's
+        # block-sparse kernel broadcasts KV heads internally), exactly as in
+        # cosmos_flashinfer.py.
         compact_N = meta.fi_compact_n * P
-        compact_shape = (B, compact_N, H, D)
+        compact_shape = (B, compact_N, H_kv, D)
         if st.compact_k is None or st.compact_k.shape != compact_shape:
             st.compact_k = query.new_zeros(*compact_shape)
             st.compact_v = query.new_zeros(*compact_shape)

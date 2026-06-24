@@ -24,6 +24,7 @@ from lvsa.sparse_attention import (
 
 from .config import LVSAConfig
 from .global_kv import build_global_kv
+from .step_tracker import native_denoise_step
 
 
 def _mask_log_should_fire(spec: str, step_idx: int, last_step: int) -> bool:
@@ -135,6 +136,20 @@ class HunyuanLVSAState:
             else:
                 self._seen_ids.add(layer_id)
 
+        # Prefer the NATIVE denoise step from vllm-omni's diffusion
+        # ForwardContext when available (authoritative; short-circuits the
+        # call-counting heuristic below). Mirrors the fallback's return shape;
+        # the fallback has no step_tracker.set_step side effect so we add none.
+        _native = native_denoise_step()
+        if _native is not None:
+            self._step = _native
+            return self._step
+
+        # ── fallback: call-counting heuristic (unchanged) ──
+        # Assumes LVSA_CFG_PASSES passes per step (default 2 = CFG); for no-CFG /
+        # guidance-distilled models on pipelines that don't publish
+        # denoise_step_idx (HunyuanVideo 1.5 / Cosmos), set LVSA_CFG_PASSES=1
+        # (see config.py).
         # Compute step from total call count. Under cfg_parallel_size=N each
         # rank only sees cfg_passes/N forwards per step — divide or the counter
         # advances at 1/N rate (halving rotation + starving [LVSA-TIME]).
@@ -214,7 +229,7 @@ class HunyuanLVSAState:
                 key_frame_interval=kfi,
                 rank=0,
                 world=1,
-                expand_window=True,
+                expand_window=cfg.expand_window,
                 keyframe_offset=offset,
                 reference_frames=cfg.reference_latent_frames,
                 sparsity_scale=cfg.sparsity_scale,
@@ -300,10 +315,23 @@ def install_hunyuan_lvsa_hook(total_latent_frames: int) -> None:
             warn_fallback(
                 origin="hunyuan_hook", reason=reason,
                 seq_len=video_seq, extra=extra,
+                # HunyuanVideo15Attention.forward routes through ``self.attn``
+                # (= the LVSA backend) just like Wan — so this does NOT go dense,
+                # it delegates to that backend. Under SP the backend re-engages
+                # LVSA on the framework-gathered grid (same mechanism as Wan);
+                # on a geometry/stream miss the backend's own check decides.
+                action=(
+                    "delegating to self.attn — LVSA backend RE-ENGAGES on the "
+                    "framework-gathered full grid (NOT dense)"
+                    if _sp_active else
+                    "delegating to self.attn (LVSA backend; dense only if it "
+                    "also fails geometry/stream on the full grid)"
+                ),
             )
-            # Delegate to the original (SP-aware) dense forward rather than
-            # reimplement it — keeps us correct against vllm-omni 0.22's
-            # signature (hidden_states_mask, joint-attention metadata).
+            # Delegate to the original forward (which routes through self.attn =
+            # the LVSA backend) rather than reimplement it — keeps us correct
+            # against vllm-omni 0.22's signature (hidden_states_mask,
+            # joint-attention metadata).
             return _orig_forward(
                 self,
                 hidden_states,
@@ -411,10 +439,6 @@ def install_hunyuan_lvsa_hook(total_latent_frames: int) -> None:
 
     # Apply the monkey-patch
     HunyuanVideo15Attention.forward = _lvsa_forward
-
-    # Tell the attention impl to just use dense (hook handles LVSA)
-    from .attention_impl import LVSAAttentionImpl
-    LVSAAttentionImpl._hook_active = True
 
     print(f"[LVSA-hook] Installed LVSA hook on HunyuanVideo15Attention "
           f"(T_lat={total_latent_frames})")

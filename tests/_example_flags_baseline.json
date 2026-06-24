@@ -1,0 +1,718 @@
+{
+  "cogvideox": {
+    "--auto-keyframes": {
+      "choices": null,
+      "default": true,
+      "nargs": 0,
+      "type": null
+    },
+    "--cp-mode": {
+      "choices": [
+        "custom",
+        "ulysses",
+        "ring"
+      ],
+      "default": "custom",
+      "nargs": null,
+      "type": null
+    },
+    "--flashinfer": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--fps": {
+      "choices": null,
+      "default": 8,
+      "nargs": null,
+      "type": "int"
+    },
+    "--guidance": {
+      "choices": null,
+      "default": 6.0,
+      "nargs": null,
+      "type": "float"
+    },
+    "--height": {
+      "choices": null,
+      "default": 480,
+      "nargs": null,
+      "type": "int"
+    },
+    "--key-frame-interval": {
+      "choices": null,
+      "default": 16,
+      "nargs": null,
+      "type": "int"
+    },
+    "--lvsa": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--model": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": "str"
+    },
+    "--n-first-frames": {
+      "choices": null,
+      "default": 4,
+      "nargs": null,
+      "type": "int"
+    },
+    "--negative-prompt": {
+      "choices": null,
+      "default": "",
+      "nargs": null,
+      "type": "str"
+    },
+    "--no-auto-keyframes": {
+      "choices": null,
+      "default": true,
+      "nargs": 0,
+      "type": null
+    },
+    "--no-expand-window": {
+      "choices": null,
+      "default": true,
+      "nargs": 0,
+      "type": null
+    },
+    "--num-frames": {
+      "choices": null,
+      "default": 49,
+      "nargs": null,
+      "type": "int"
+    },
+    "--output-dir": {
+      "choices": null,
+      "default": ".",
+      "nargs": null,
+      "type": "str"
+    },
+    "--output-name": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": "str"
+    },
+    "--profile": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--prompt": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": "str"
+    },
+    "--rotate-keyframes": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--seed": {
+      "choices": null,
+      "default": 16,
+      "nargs": null,
+      "type": "int"
+    },
+    "--show-mask": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--show-mask-compact": {
+      "choices": [
+        "once",
+        "step"
+      ],
+      "default": null,
+      "nargs": "?",
+      "type": null
+    },
+    "--sparsity-scale": {
+      "choices": null,
+      "default": 1.0,
+      "nargs": null,
+      "type": "float"
+    },
+    "--steps": {
+      "choices": null,
+      "default": 50,
+      "nargs": null,
+      "type": "int"
+    },
+    "--width": {
+      "choices": null,
+      "default": 720,
+      "nargs": null,
+      "type": "int"
+    },
+    "--window-size": {
+      "choices": null,
+      "default": 12,
+      "nargs": null,
+      "type": "int"
+    },
+    "-h": {
+      "choices": null,
+      "default": null,
+      "nargs": 0,
+      "type": null
+    }
+  },
+  "cosmos": {
+    "--auto-keyframes": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--flashinfer": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--fps": {
+      "choices": null,
+      "default": 16,
+      "nargs": null,
+      "type": "int"
+    },
+    "--guidance": {
+      "choices": null,
+      "default": 6.0,
+      "nargs": null,
+      "type": "float"
+    },
+    "--height": {
+      "choices": null,
+      "default": 720,
+      "nargs": null,
+      "type": "int"
+    },
+    "--key-frame-interval": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": "int"
+    },
+    "--lvsa": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--model": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": null
+    },
+    "--n-first-frames": {
+      "choices": null,
+      "default": 4,
+      "nargs": null,
+      "type": "int"
+    },
+    "--negative-prompt": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": "str"
+    },
+    "--no-expand-window": {
+      "choices": null,
+      "default": true,
+      "nargs": 0,
+      "type": null
+    },
+    "--num-frames": {
+      "choices": null,
+      "default": 189,
+      "nargs": null,
+      "type": "int"
+    },
+    "--output-dir": {
+      "choices": null,
+      "default": "out/adhoc",
+      "nargs": null,
+      "type": "Path"
+    },
+    "--output-name": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": null
+    },
+    "--profile": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--prompt": {
+      "choices": null,
+      "default": "A dog running in the forest.",
+      "nargs": null,
+      "type": null
+    },
+    "--reference-latent-frames": {
+      "choices": null,
+      "default": 48,
+      "nargs": null,
+      "type": "int"
+    },
+    "--rotate-keyframes": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--seed": {
+      "choices": null,
+      "default": 16,
+      "nargs": null,
+      "type": "int"
+    },
+    "--show-mask": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--show-mask-compact": {
+      "choices": [
+        "once",
+        "step"
+      ],
+      "default": null,
+      "nargs": "?",
+      "type": null
+    },
+    "--sparsity-scale": {
+      "choices": null,
+      "default": 1.0,
+      "nargs": null,
+      "type": "float"
+    },
+    "--steps": {
+      "choices": null,
+      "default": 35,
+      "nargs": null,
+      "type": "int"
+    },
+    "--width": {
+      "choices": null,
+      "default": 1280,
+      "nargs": null,
+      "type": "int"
+    },
+    "--window-size": {
+      "choices": null,
+      "default": 12,
+      "nargs": null,
+      "type": "int"
+    },
+    "-h": {
+      "choices": null,
+      "default": null,
+      "nargs": 0,
+      "type": null
+    }
+  },
+  "hunyuan": {
+    "--auto-keyframes": {
+      "choices": null,
+      "default": true,
+      "nargs": 0,
+      "type": null
+    },
+    "--cp-mode": {
+      "choices": [
+        "custom",
+        "ulysses",
+        "ring"
+      ],
+      "default": "custom",
+      "nargs": null,
+      "type": null
+    },
+    "--flashinfer": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--fps": {
+      "choices": null,
+      "default": 24,
+      "nargs": null,
+      "type": "int"
+    },
+    "--guidance": {
+      "choices": null,
+      "default": 6.0,
+      "nargs": null,
+      "type": "float"
+    },
+    "--height": {
+      "choices": null,
+      "default": 480,
+      "nargs": null,
+      "type": "int"
+    },
+    "--key-frame-interval": {
+      "choices": null,
+      "default": 16,
+      "nargs": null,
+      "type": "int"
+    },
+    "--lvsa": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--model": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": "str"
+    },
+    "--n-first-frames": {
+      "choices": null,
+      "default": 4,
+      "nargs": null,
+      "type": "int"
+    },
+    "--negative-prompt": {
+      "choices": null,
+      "default": "",
+      "nargs": null,
+      "type": "str"
+    },
+    "--no-auto-keyframes": {
+      "choices": null,
+      "default": true,
+      "nargs": 0,
+      "type": null
+    },
+    "--no-expand-window": {
+      "choices": null,
+      "default": true,
+      "nargs": 0,
+      "type": null
+    },
+    "--num-frames": {
+      "choices": null,
+      "default": 61,
+      "nargs": null,
+      "type": "int"
+    },
+    "--output-dir": {
+      "choices": null,
+      "default": ".",
+      "nargs": null,
+      "type": "str"
+    },
+    "--output-latent": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--output-name": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": "str"
+    },
+    "--profile": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--prompt": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": "str"
+    },
+    "--rotate-keyframes": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--seed": {
+      "choices": null,
+      "default": 16,
+      "nargs": null,
+      "type": "int"
+    },
+    "--show-mask": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--show-mask-compact": {
+      "choices": [
+        "once",
+        "step"
+      ],
+      "default": null,
+      "nargs": "?",
+      "type": null
+    },
+    "--sparsity-scale": {
+      "choices": null,
+      "default": 1.0,
+      "nargs": null,
+      "type": "float"
+    },
+    "--steps": {
+      "choices": null,
+      "default": 50,
+      "nargs": null,
+      "type": "int"
+    },
+    "--width": {
+      "choices": null,
+      "default": 832,
+      "nargs": null,
+      "type": "int"
+    },
+    "--window-size": {
+      "choices": null,
+      "default": 12,
+      "nargs": null,
+      "type": "int"
+    },
+    "-h": {
+      "choices": null,
+      "default": null,
+      "nargs": 0,
+      "type": null
+    }
+  },
+  "wan": {
+    "--auto-keyframes": {
+      "choices": null,
+      "default": true,
+      "nargs": 0,
+      "type": null
+    },
+    "--balanced": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--cp-mode": {
+      "choices": [
+        "custom",
+        "ulysses",
+        "ring"
+      ],
+      "default": "custom",
+      "nargs": null,
+      "type": null
+    },
+    "--flashinfer": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--fps": {
+      "choices": null,
+      "default": 16,
+      "nargs": null,
+      "type": "int"
+    },
+    "--guidance": {
+      "choices": null,
+      "default": 5.0,
+      "nargs": null,
+      "type": "float"
+    },
+    "--height": {
+      "choices": null,
+      "default": 480,
+      "nargs": null,
+      "type": "int"
+    },
+    "--key-frame-interval": {
+      "choices": null,
+      "default": 16,
+      "nargs": null,
+      "type": "int"
+    },
+    "--lvsa": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--model": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": "str"
+    },
+    "--n-first-frames": {
+      "choices": null,
+      "default": 4,
+      "nargs": null,
+      "type": "int"
+    },
+    "--negative-prompt": {
+      "choices": null,
+      "default": "\u8272\u8c03\u8273\u4e3d\uff0c\u8fc7\u66dd\uff0c\u9759\u6001\uff0c\u7ec6\u8282\u6a21\u7cca\u4e0d\u6e05\uff0c\u5b57\u5e55\uff0c\u98ce\u683c\uff0c\u4f5c\u54c1\uff0c\u753b\u4f5c\uff0c\u753b\u9762\uff0c\u9759\u6b62\uff0c\u6574\u4f53\u53d1\u7070\uff0c\u6700\u5dee\u8d28\u91cf\uff0c\u4f4e\u8d28\u91cf\uff0cJPEG\u538b\u7f29\u6b8b\u7559\uff0c\u4e11\u964b\u7684\uff0c\u6b8b\u7f3a\u7684\uff0c\u591a\u4f59\u7684\u624b\u6307\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u624b\u90e8\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u8138\u90e8\uff0c\u7578\u5f62\u7684\uff0c\u6bc1\u5bb9\u7684\uff0c\u5f62\u6001\u7578\u5f62\u7684\u80a2\u4f53\uff0c\u624b\u6307\u878d\u5408\uff0c\u9759\u6b62\u4e0d\u52a8\u7684\u753b\u9762\uff0c\u6742\u4e71\u7684\u80cc\u666f\uff0c\u4e09\u6761\u817f\uff0c\u80cc\u666f\u4eba\u5f88\u591a\uff0c\u5012\u7740\u8d70",
+      "nargs": null,
+      "type": "str"
+    },
+    "--no-auto-keyframes": {
+      "choices": null,
+      "default": true,
+      "nargs": 0,
+      "type": null
+    },
+    "--no-expand-window": {
+      "choices": null,
+      "default": true,
+      "nargs": 0,
+      "type": null
+    },
+    "--num-frames": {
+      "choices": null,
+      "default": 81,
+      "nargs": null,
+      "type": "int"
+    },
+    "--output-dir": {
+      "choices": null,
+      "default": ".",
+      "nargs": null,
+      "type": "str"
+    },
+    "--output-name": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": "str"
+    },
+    "--profile": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--prompt": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": "str"
+    },
+    "--reference-latent-frames": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": "int"
+    },
+    "--riflex": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--riflex-k": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": "int"
+    },
+    "--riflex-s": {
+      "choices": null,
+      "default": 1.0,
+      "nargs": null,
+      "type": "float"
+    },
+    "--riflex-train-len": {
+      "choices": null,
+      "default": null,
+      "nargs": null,
+      "type": "int"
+    },
+    "--rotate-keyframes": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--seed": {
+      "choices": null,
+      "default": 16,
+      "nargs": null,
+      "type": "int"
+    },
+    "--show-mask": {
+      "choices": null,
+      "default": false,
+      "nargs": 0,
+      "type": null
+    },
+    "--show-mask-compact": {
+      "choices": [
+        "once",
+        "step"
+      ],
+      "default": null,
+      "nargs": "?",
+      "type": null
+    },
+    "--sparsity-scale": {
+      "choices": null,
+      "default": 1.0,
+      "nargs": null,
+      "type": "float"
+    },
+    "--steps": {
+      "choices": null,
+      "default": 40,
+      "nargs": null,
+      "type": "int"
+    },
+    "--width": {
+      "choices": null,
+      "default": 832,
+      "nargs": null,
+      "type": "int"
+    },
+    "--window-size": {
+      "choices": null,
+      "default": 12,
+      "nargs": null,
+      "type": "int"
+    },
+    "-h": {
+      "choices": null,
+      "default": null,
+      "nargs": 0,
+      "type": null
+    }
+  }
+}

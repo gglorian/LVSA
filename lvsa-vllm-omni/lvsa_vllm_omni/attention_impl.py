@@ -26,6 +26,7 @@ from lvsa.sparse_attention import (
 )
 
 from . import step_tracker
+from .step_tracker import native_denoise_step
 from ._sp import cfg_parallel_world_size
 from .config import LVSAConfig
 from .global_kv import build_global_kv
@@ -98,6 +99,21 @@ class _StepCounter:
             else:
                 self._seen_ids.add(layer_id)
 
+        # Prefer the NATIVE denoise step from vllm-omni's diffusion
+        # ForwardContext (populated per-step by Wan 2.2 pipelines). When it is
+        # available it is authoritative — short-circuit the call-counting
+        # heuristic below (which is only correct under the default 2-pass CFG
+        # cadence). Mirrors the heuristic path's set_step side effect + return.
+        _native = native_denoise_step()
+        if _native is not None:
+            self._step = _native
+            step_tracker.set_step(self._step)
+            return self._step
+
+        # ── fallback: call-counting heuristic (unchanged) ──
+        # Assumes LVSA_CFG_PASSES forward passes per step (default 2 = CFG);
+        # for no-CFG / guidance-distilled models on pipelines that don't publish
+        # denoise_step_idx, set LVSA_CFG_PASSES=1 (see config.py).
         # Compute step_idx from total call count. One denoising step =
         # n_blocks * per-rank cfg passes. Under cfg_parallel_size=N the
         # cond/uncond passes run on different ranks, so each rank only sees
@@ -257,6 +273,7 @@ class LVSAAttentionImpl:
 
     _total_instances: int = 0
     _logged_geometry: bool = False
+    _logged_geometry_ambiguous: set = set()  # once-guard per candidate set
 
     def __init__(
         self,
@@ -320,6 +337,15 @@ class LVSAAttentionImpl:
         # Cross-attention: different seq lengths → dense (benign, no warning)
         if query.shape[1] != key.shape[1]:
             return self._dense_attention(query, key, value)
+
+        # NOTE: do NOT gate on is_sp_active() here. Under Ulysses-SP the framework
+        # all-to-all GATHERS the full T_lat×P grid before forward_cuda runs, so
+        # this rank sees the full grid and LVSA engages correctly (GPU-verified:
+        # backend under --ulysses 2 → full video_seq, sparse, output ~36 dB vs
+        # single-GPU). A blanket is_sp_active()→dense gate wrongly disabled that.
+        # SP-safety is the geometry check below: a genuinely sharded fragment
+        # won't match the canonical P → dense fallback; multi-candidate ambiguity
+        # is disambiguated deterministically in _detect_geometry.
 
         # Resolve T_lat from config/env
         total_frames = self._resolve_total_frames()
@@ -423,7 +449,7 @@ class LVSAAttentionImpl:
                 key_frame_interval=kfi,
                 rank=0,
                 world=1,
-                expand_window=True,
+                expand_window=cfg.expand_window,
                 keyframe_offset=offset,
                 reference_frames=cfg.reference_latent_frames,
                 sparsity_scale=cfg.sparsity_scale,
@@ -523,19 +549,45 @@ class LVSAAttentionImpl:
         Returns (P, text_tokens) if geometry matches, or (None, None) for
         warmup/dummy runs where the sequence doesn't match expected video frames.
         """
-        # Try each candidate patches-per-frame value in turn
-        for p in _ppf_candidates():
+        # Collect ALL candidate patches-per-frame values that yield a valid
+        # split (encoder tokens in [0, video_seq)). With a multi-value
+        # LVSA_PATCHES_PER_FRAME, more than one P can match — first-match-wins
+        # would be order-dependent and could silently pick a WRONG P (corrupt
+        # sparse pattern). Instead disambiguate deterministically.
+        candidates = _ppf_candidates()
+        matches = []  # (text, p, video_seq)
+        for p in candidates:
             video_seq = total_frames * p
             text = seq_len - video_seq
             if text >= 0 and text < video_seq:
-                if not LVSAAttentionImpl._logged_geometry:
-                    LVSAAttentionImpl._logged_geometry = True
-                    print(f"[LVSA] Geometry detected: T_lat={total_frames} P={p} "
-                          f"video_seq={video_seq} text={text} total={seq_len}")
-                return p, text
+                matches.append((text, p, video_seq))
 
-        # No known P matched → skip LVSA (warmup/dummy run or unknown model)
-        return None, None
+        if not matches:
+            # No known P matched → skip LVSA (warmup/dummy run or unknown model)
+            return None, None
+
+        if len(matches) > 1:
+            # Ambiguous: pick the tightest video fit (smallest encoder split),
+            # NOT list order. Warn once per distinct candidate set.
+            key = tuple(candidates)
+            if key not in LVSAAttentionImpl._logged_geometry_ambiguous:
+                LVSAAttentionImpl._logged_geometry_ambiguous.add(key)
+                cand_str = ", ".join(
+                    f"P={p}(text={t})" for t, p, _ in sorted(matches)
+                )
+                print(f"[LVSA] WARNING: ambiguous geometry — multiple "
+                      f"patches-per-frame candidates match "
+                      f"(T_lat={total_frames} total={seq_len}): {cand_str}; "
+                      f"candidates={list(candidates)}. Picking smallest-text "
+                      f"(tightest video fit) deterministically. Set "
+                      f"LVSA_PATCHES_PER_FRAME explicitly to disambiguate.")
+
+        text, p, video_seq = min(matches)  # smallest text (then smallest p)
+        if not LVSAAttentionImpl._logged_geometry:
+            LVSAAttentionImpl._logged_geometry = True
+            print(f"[LVSA] Geometry detected: T_lat={total_frames} P={p} "
+                  f"video_seq={video_seq} text={text} total={seq_len}")
+        return p, text
 
     def _resolve_total_frames(self) -> Optional[int]:
         if self.config.total_latent_frames is not None:

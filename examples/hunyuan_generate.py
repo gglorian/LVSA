@@ -2,9 +2,12 @@
 hunyuan_generate.py — Video generation with HunyuanVideo-1.5, supporting single and multi-GPU inference.
 ================================================================================================================
 
-**Status: experimental.**  The HunyuanVideoAdapter has not been tested end-to-end with actual
-HunyuanVideo weights.  LVSA is applied only to single-stream blocks; dual-stream blocks use
-standard full attention.
+**Status: experimental.**  HunyuanVideo-1.5 is **all dual-stream (MMDiT) blocks** — there are
+no single-stream blocks, and LVSA installs on *every* block (video stream = sparse LVSA,
+text stream = full attention over the joint sequence).  Under multi-GPU CP the dual-stream
+**text-query** branch now gathers the full video K/V across ranks (see
+``DistributedLVSAProcessor._compute_encoder_query_attention``); before the 2026-06-18 fix it
+attended only the per-rank video shard, so HV diverged from single-GPU in every cp_mode.
 
 Usage
 -----
@@ -27,6 +30,14 @@ torchrun --nproc_per_node=2 hunyuan_parallel_lvsa.py \\
     --num-frames 61 --height 480 --width 832 --lvsa
 """
 
+import sys
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from examples._runner import (
+    add_common_args, add_lvsa_args, resolve_distributed,
+    setup_cp, build_output_path, install_scheduler_step_hook,
+)
+
 import os
 import time
 import argparse
@@ -42,75 +53,35 @@ from lvsa.parallel import (
     patch_rotary_emb_for_context_parallel,
     install_lvsa_processors,
     compute_and_validate_seq_len,
-    setup_context_parallel,
 )
 
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="HunyuanVideo generation with optional LVSA and multi-GPU context parallelism",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── Model ─────────────────────────────────────────────────────────────────
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        metavar="PATH",
-        help="Path or HuggingFace Hub ID of the HunyuanVideo pipeline "
-        "(e.g. hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v).",
+    add_common_args(parser)
+    add_lvsa_args(parser)
+
+    # Restore hunyuan's per-model defaults for the common flags that add_common_args left unset:
+    parser.set_defaults(
+        steps=50,
+        num_frames=61,
+        height=480,
+        width=832,
+        fps=24,
+        guidance=6.0,
+        seed=16,
+        negative_prompt="",
     )
 
-    # ── Prompt ────────────────────────────────────────────────────────────────
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        required=True,
-        help="Text prompt describing the video to generate.",
-    )
-    parser.add_argument(
-        "--negative-prompt",
-        type=str,
-        default="",
-        help="Negative prompt for quality filtering.",
-    )
+    # ── Hunyuan-specific args NOT covered by the shared helpers ───────────────────
 
-    # ── Video dimensions ──────────────────────────────────────────────────────
-    parser.add_argument(
-        "--num-frames",
-        type=int,
-        default=61,
-        help="Frames to generate (default 61 for ~4s at 15fps).",
-    )
-    parser.add_argument("--height", type=int, default=480, help="Frame height (px).")
-    parser.add_argument("--width", type=int, default=832, help="Frame width (px).")
-
-    # ── Sampling ──────────────────────────────────────────────────────────────
-    parser.add_argument("--steps", type=int, default=50, help="Denoising steps.")
-    parser.add_argument("--guidance", type=float, default=6.0, help="CFG scale.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--fps", type=int, default=24, help="Output FPS.")
-
-    # ── Output ────────────────────────────────────────────────────────────────
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=".",
-        help="Output directory for the generated video. Created if missing.",
-    )
-    parser.add_argument(
-        "--output-name",
-        type=str,
-        default=None,
-        help="Output filename inside --output-dir. If omitted, a descriptive "
-        "name encoding model, geometry, backend, and run parameters is "
-        "auto-generated. Extension (.mp4 or .pt for --output-latent) is "
-        "appended automatically if missing.",
-    )
     parser.add_argument(
         "--output-latent",
         action="store_true",
@@ -119,37 +90,29 @@ def parse_args() -> argparse.Namespace:
         "offline on higher-memory hardware.",
     )
 
-    # ── LVSA ───────────────────────────────────────────────────────────────────
-    lvsa = parser.add_argument_group(
-        "Sliding Window Attention (LVSA)",
-        "Block-sparse attention to reduce memory for long videos. "
-        "Add --lvsa to enable; all other LVSA flags are ignored otherwise.",
-    )
-    lvsa.add_argument("--lvsa", action="store_true", help="Enable LVSA (block-sparse attention).")
-    lvsa.add_argument("--window-size", type=int, default=12, help="LVSA window half-width (video frames).")
-    lvsa.add_argument("--n-first-frames", type=int, default=4, help="Leading global context frames.")
-    lvsa.add_argument("--key-frame-interval", type=int, default=16, help="Periodic keyframe interval (video frames).")
-    lvsa.add_argument("--sparsity-scale", type=float, default=1.0,
-                     help="Scale factor for the attention sparsity budget. "
-                     "<1.0 = more sparse, >1.0 = less sparse. Default 1.0.")
-    lvsa.add_argument("--auto-keyframes", action="store_true", help="Auto-compute key-frame-interval.")
-    lvsa.add_argument("--flashinfer", action="store_true", help="Use FlashInfer block-sparse attention.")
-    lvsa.add_argument("--show-mask", action="store_true", help="Print attention mask.")
-    lvsa.add_argument("--show-mask-compact", nargs="?", const="once", default=None, choices=["once", "step"])
-    lvsa.add_argument("--rotate-keyframes", action="store_true", help="Rotate keyframes each step.")
-    lvsa.add_argument(
-        "--cp-mode", choices=["custom", "ulysses"], default="custom",
+    parser.add_argument(
+        "--cp-mode", choices=["custom", "ulysses", "ring"], default="custom",
         help="Context-parallel attention mode (multi-GPU only). 'custom' (default) = "
              "all_reduce of global K/V + boundary guards (no head-count constraint). "
              "'ulysses' = all-to-all gather the full sequence, run the single-device "
              "LVSA pattern (needs num_heads %% world == 0; HunyuanVideo 1.5 has 16 "
-             "heads -> world must divide 16).",
+             "heads -> world must divide 16). 'ring' = true ring rotation of K/V with "
+             "the LVSA block-mask per step (no num_heads %% world constraint, unlike "
+             "ulysses; compute-only savings, O(world) comm).",
     )
 
-    # ── Profiling ─────────────────────────────────────────────────────────────
-    parser.add_argument("--profile", action="store_true", help="Log per-step timing.")
+    parser.add_argument(
+        "--key-frame-interval",
+        type=int,
+        default=16,
+        help="Periodic keyframe interval (video frames).",
+    )
 
-    return parser.parse_args()
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -159,31 +122,10 @@ def main() -> None:
     args = parse_args()
 
     # ── Distributed vs single-GPU detection ────────────────────────────────────
-    from lvsa.device import (
-        enable_fast_matmul,
-        get_device,
-        get_distributed_backend,
-        max_memory_allocated,
-        mem_get_info,
-    )
+    from lvsa.device import max_memory_allocated, mem_get_info
 
-    distributed = "RANK" in os.environ
-    if distributed:
-        dist.init_process_group(get_distributed_backend())
-        rank = dist.get_rank()
-        world = dist.get_world_size()
-    else:
-        rank = 0
-        world = 1
-
-    device = get_device(rank)
-
-    os.environ["HF_ENABLE_PARALLEL_LOADING"] = "YES"
-    enable_fast_matmul()
-
-    if rank == 0:
-        mode = f"distributed (world_size={world})" if distributed else "single-GPU"
-        print(f"[init] {mode}  device={device}")
+    ctx = resolve_distributed()
+    rank, world, device, distributed = ctx.rank, ctx.world, ctx.device, ctx.distributed
 
     # ── Create model adapter ─────────────────────────────────────────────────
     adapter = HunyuanVideoAdapter()
@@ -233,7 +175,7 @@ def main() -> None:
 
     # ── Context-parallel plan (multi-GPU only) ────────────────────────────────
     if world > 1:
-        setup_context_parallel(adapter, pipe.transformer, world)
+        setup_cp(adapter, pipe, world)
 
     if rank == 0:
         print(f"[model] loaded in {time.time() - t0:.1f}s")
@@ -252,37 +194,7 @@ def main() -> None:
     # ── Rotating keyframes / profiling ─────────────────────────────────────
     # HunyuanVideo15Pipeline does not support callback_on_step_end, so we
     # hook into the scheduler's step() method to inject per-step logic.
-    if lvsa_processor is not None or args.profile:
-        if rank == 0 and lvsa_processor:
-            print("[LVSA] windowed attention for all steps")
-
-        _step_counter = [0]
-        _step_times: list = []
-        _orig_scheduler_step = pipe.scheduler.step
-
-        def _hooked_scheduler_step(*s_args, **s_kwargs):
-            step_index = _step_counter[0]
-
-            if lvsa_processor is not None:
-                if args.rotate_keyframes:
-                    lvsa_processor.set_step(step_index)
-
-                if rank == 0 and args.show_mask_compact == "step":
-                    print(f"\n[LVSA-WINDOW] step {step_index}:")
-                    lvsa_processor.print_attention_mask_compact()
-
-            if args.profile and rank == 0:
-                now = time.time()
-                _step_times.append(now)
-                if len(_step_times) > 1:
-                    dt = now - _step_times[-2]
-                    print(f"[profile] step {step_index}: {dt:.3f}s")
-
-            result = _orig_scheduler_step(*s_args, **s_kwargs)
-            _step_counter[0] += 1
-            return result
-
-        pipe.scheduler.step = _hooked_scheduler_step
+    install_scheduler_step_hook(pipe, args, lvsa_processor, rank)
 
     # HunyuanVideo-1.5 uses a guider (ClassifierFreeGuidance) instead of
     # guidance_scale at runtime.  Set the guidance scale on the guider.
@@ -317,40 +229,9 @@ def main() -> None:
     # ── Save (rank 0 only) ────────────────────────────────────────────────────
     if rank == 0:
         mem_mb = max_memory_allocated() / 1024**2
-        if args.lvsa:
-            backend = "flashinfer" if args.flashinfer else "sdpa"
-            kfi_tag = "auto" if args.auto_keyframes else str(args.key_frame_interval)
-            rot_tag = "_rot" if args.rotate_keyframes else ""
-            ring_tag = ""
-            lvsa_tag = (
-                f"_lvsa_w{args.window_size}_f{args.n_first_frames}"
-                f"_kfi{kfi_tag}{rot_tag}{ring_tag}_{backend}"
-            )
-        else:
-            lvsa_tag = "_fullatt"
         ext = "pt" if args.output_latent else "mp4"
-        if args.output_name:
-            filename = args.output_name
-            if not filename.endswith(f".{ext}"):
-                filename += f".{ext}"
-        else:
-            stem = os.path.basename(__file__).split(".")[0]
-            model_tag = os.path.basename(args.model)
-            prompt_tag = args.prompt.replace(" ", "_")[:30]
-            filename = (
-                f"{stem}"
-                f"_{model_tag}"
-                f"_gpu{world}"
-                f"_{args.height}x{args.width}@{args.fps}"
-                f"_frames{args.num_frames}"
-                f"{lvsa_tag}"
-                f"_steps{args.steps}_cfg{args.guidance}"
-                f"_seed{args.seed}"
-                f"_dur{gen_duration:.0f}s_mem{mem_mb:.0f}MB"
-                f"_{prompt_tag}"
-                f".{ext}"
-            )
-        out_path = os.path.join(args.output_dir, filename)
+        out_path = build_output_path(args, world, gen_duration, mem_mb,
+                                     stem="hunyuan_generate", ext=ext)
         os.makedirs(args.output_dir, exist_ok=True)
 
         t_exp = time.time()

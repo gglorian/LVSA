@@ -19,8 +19,16 @@ def warn_fallback(
     reason: str,
     seq_len: int = -1,
     extra: Optional[dict] = None,
+    action: str = "falling back to DENSE attention",
 ) -> None:
-    """Emit a one-time warning when LVSA falls back to dense attention.
+    """Emit a one-time warning when LVSA can't run sparse on this call.
+
+    ``action`` describes what happens INSTEAD of the LVSA sparse path. The
+    default is a dense fallback, but not every site goes dense: the Wan hook
+    hands off to ``self.attn`` (= the LVSA *backend*), which under
+    sequence-parallel RE-ENGAGES LVSA on the framework-gathered full grid.
+    Pass ``action`` so the log states the real target rather than always
+    claiming "DENSE".
 
     Parameters
     ----------
@@ -34,6 +42,10 @@ def warn_fallback(
         Sequence length at the fallback site (helps diagnose detection issues).
     extra : dict, optional
         Additional context keys (e.g. ``{"T_lat": 33, "P_tried": 1560}``).
+    action : str
+        Human-readable description of what runs instead of LVSA on this call
+        (``"falling back to DENSE attention"`` by default, or a delegate-to
+        message for sites that hand off to another forward).
     """
     if not _FALLBACK_WARN:
         return
@@ -46,7 +58,7 @@ def warn_fallback(
         extra_str = " " + ", ".join(f"{k}={v}" for k, v in extra.items())
     print(
         f"[LVSA-FALLBACK] origin={origin} reason={reason} seq_len={seq_len}{extra_str} "
-        f"-- falling back to DENSE attention "
+        f"-- {action} "
         f"(set LVSA_WARN_FALLBACK=0 to silence)",
         flush=True,
     )

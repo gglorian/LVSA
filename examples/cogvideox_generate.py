@@ -29,6 +29,14 @@ torchrun --nproc_per_node=2 cogvideox_parallel_lvsa.py \\
     --num-frames 49 --height 480 --width 720 --lvsa
 """
 
+import sys
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from examples._runner import (
+    add_common_args, add_lvsa_args, resolve_distributed,
+    setup_cp, build_output_path, install_scheduler_step_hook,
+)
+
 import os
 import time
 import argparse
@@ -41,8 +49,6 @@ from diffusers.utils import export_to_video
 
 from lvsa.adapters.cogvideox import CogVideoXAdapter
 from lvsa.device import (
-    get_device,
-    get_distributed_backend,
     max_memory_allocated,
     mem_get_info,
 )
@@ -50,98 +56,57 @@ from lvsa.parallel import (
     patch_rotary_emb_for_context_parallel,
     install_lvsa_processors,
     compute_and_validate_seq_len,
-    setup_context_parallel,
 )
 
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="CogVideoX generation with optional LVSA and multi-GPU context parallelism",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── Model ─────────────────────────────────────────────────────────────────
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        metavar="PATH",
-        help="Path or HuggingFace Hub ID of the CogVideoX pipeline "
-        "(e.g. THUDM/CogVideoX-2b, THUDM/CogVideoX-5b).",
+    add_common_args(parser)
+    add_lvsa_args(parser)
+
+    # Restore CogVideoX's per-model defaults for flags that add_common_args left unset:
+    parser.set_defaults(
+        steps=50,
+        num_frames=49,
+        height=480,
+        width=720,
+        fps=8,
+        guidance=6.0,
+        seed=16,
+        negative_prompt="",
     )
 
-    # ── Prompt ────────────────────────────────────────────────────────────────
+    # ── CogVideoX-specific args NOT covered by the shared helpers ─────────────
     parser.add_argument(
-        "--prompt",
-        type=str,
-        required=True,
-        help="Text prompt describing the video to generate.",
-    )
-    parser.add_argument(
-        "--negative-prompt",
-        type=str,
-        default="",
-        help="Negative prompt for quality filtering.",
+        "--cp-mode", choices=["custom", "ulysses", "ring"], default="custom",
+        help="Context-parallel attention mode (multi-GPU only). 'custom' (default) = "
+             "all_reduce of global K/V + boundary guards (no head-count constraint). "
+             "'ulysses' = all-to-all gather the full sequence, run the single-device "
+             "LVSA pattern (needs num_heads %% world == 0; HunyuanVideo 1.5 has 16 "
+             "heads -> world must divide 16). 'ring' = true ring rotation of K/V with "
+             "the LVSA block-mask per step (no num_heads %% world constraint, unlike "
+             "ulysses; compute-only savings, O(world) comm).",
     )
 
-    # ── Video dimensions ──────────────────────────────────────────────────────
     parser.add_argument(
-        "--num-frames",
+        "--key-frame-interval",
         type=int,
-        default=49,
-        help="Frames to generate (default 49 for CogVideoX native).",
-    )
-    parser.add_argument("--height", type=int, default=480, help="Frame height (px).")
-    parser.add_argument("--width", type=int, default=720, help="Frame width (px).")
-
-    # ── Sampling ──────────────────────────────────────────────────────────────
-    parser.add_argument("--steps", type=int, default=50, help="Denoising steps.")
-    parser.add_argument("--guidance", type=float, default=6.0, help="CFG scale.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--fps", type=int, default=8, help="Output FPS.")
-
-    # ── Output ────────────────────────────────────────────────────────────────
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=".",
-        help="Output directory for the generated video. Created if missing.",
-    )
-    parser.add_argument(
-        "--output-name",
-        type=str,
-        default=None,
-        help="Output filename inside --output-dir. If omitted, a descriptive "
-        "name encoding model, geometry, backend, and run parameters is "
-        "auto-generated. Extension (.mp4) is appended automatically if missing.",
+        default=16,
+        help="Periodic keyframe interval (video frames).",
     )
 
-    # ── LVSA ───────────────────────────────────────────────────────────────────
-    lvsa = parser.add_argument_group(
-        "Sliding Window Attention (LVSA)",
-        "Block-sparse attention to reduce memory for long videos. "
-        "Add --lvsa to enable; all other LVSA flags are ignored otherwise.",
-    )
-    lvsa.add_argument("--lvsa", action="store_true", help="Enable LVSA (block-sparse attention).")
-    lvsa.add_argument("--window-size", type=int, default=12, help="LVSA window half-width (video frames).")
-    lvsa.add_argument("--n-first-frames", type=int, default=4, help="Leading global context frames.")
-    lvsa.add_argument("--key-frame-interval", type=int, default=16, help="Periodic keyframe interval (video frames).")
-    lvsa.add_argument("--sparsity-scale", type=float, default=1.0,
-                     help="Scale factor for the attention sparsity budget. "
-                     "<1.0 = more sparse, >1.0 = less sparse. Default 1.0.")
-    lvsa.add_argument("--auto-keyframes", action="store_true", help="Auto-compute key-frame-interval.")
-    lvsa.add_argument("--flashinfer", action="store_true", help="Use FlashInfer block-sparse attention.")
-    lvsa.add_argument("--show-mask", action="store_true", help="Print attention mask.")
-    lvsa.add_argument("--show-mask-compact", nargs="?", const="once", default=None, choices=["once", "step"])
-    lvsa.add_argument("--rotate-keyframes", action="store_true", help="Rotate keyframes each step.")
+    return parser
 
-    # ── Profiling ─────────────────────────────────────────────────────────────
-    parser.add_argument("--profile", action="store_true", help="Log per-step timing.")
 
-    return parser.parse_args()
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -151,23 +116,8 @@ def main() -> None:
     args = parse_args()
 
     # ── Distributed vs single-GPU detection ────────────────────────────────────
-    distributed = "RANK" in os.environ
-    if distributed:
-        dist.init_process_group(get_distributed_backend())
-        rank = dist.get_rank()
-        world = dist.get_world_size()
-    else:
-        rank = 0
-        world = 1
-
-    device = get_device(rank)
-
-    os.environ["HF_ENABLE_PARALLEL_LOADING"] = "YES"
-    torch.backends.cuda.matmul.allow_tf32 = True
-
-    if rank == 0:
-        mode = f"distributed (world_size={world})" if distributed else "single-GPU"
-        print(f"[init] {mode}  device={device}")
+    ctx = resolve_distributed()
+    rank, world, device, distributed = ctx.rank, ctx.world, ctx.device, ctx.distributed
 
     # ── Create model adapter ─────────────────────────────────────────────────
     adapter = CogVideoXAdapter()
@@ -215,7 +165,7 @@ def main() -> None:
 
     # ── Context-parallel plan (multi-GPU only) ────────────────────────────────
     if world > 1:
-        setup_context_parallel(adapter, pipe.transformer, world)
+        setup_cp(adapter, pipe, world)
 
     if rank == 0:
         print(f"[model] loaded in {time.time() - t0:.1f}s")
@@ -232,37 +182,9 @@ def main() -> None:
     t_gen = time.time()
 
     # ── Rotating keyframes / profiling ─────────────────────────────────────
-    if lvsa_processor is not None or args.profile:
-        if rank == 0 and lvsa_processor:
-            print("[LVSA] windowed attention for all steps")
-
-        _step_counter = [0]
-        _step_times: list = []
-        _orig_scheduler_step = pipe.scheduler.step
-
-        def _hooked_scheduler_step(*s_args, **s_kwargs):
-            step_index = _step_counter[0]
-
-            if lvsa_processor is not None:
-                if args.rotate_keyframes:
-                    lvsa_processor.set_step(step_index)
-
-                if rank == 0 and args.show_mask_compact == "step":
-                    print(f"\n[LVSA-WINDOW] step {step_index}:")
-                    lvsa_processor.print_attention_mask_compact()
-
-            if args.profile and rank == 0:
-                now = time.time()
-                _step_times.append(now)
-                if len(_step_times) > 1:
-                    dt = now - _step_times[-2]
-                    print(f"[profile] step {step_index}: {dt:.3f}s")
-
-            result = _orig_scheduler_step(*s_args, **s_kwargs)
-            _step_counter[0] += 1
-            return result
-
-        pipe.scheduler.step = _hooked_scheduler_step
+    # CogVideoX does not support callback_on_step_end, so we hook into the
+    # scheduler's step() method to inject per-step logic (gains [LVSA-TIME]/[LVSA-MEM]).
+    install_scheduler_step_hook(pipe, args, lvsa_processor, rank)
 
     output = pipe(
         prompt=args.prompt,
@@ -285,39 +207,8 @@ def main() -> None:
     # ── Save (rank 0 only) ────────────────────────────────────────────────────
     if rank == 0:
         mem_mb = max_memory_allocated() / 1024**2
-        if args.lvsa:
-            backend = "flashinfer" if args.flashinfer else "sdpa"
-            kfi_tag = "auto" if args.auto_keyframes else str(args.key_frame_interval)
-            rot_tag = "_rot" if args.rotate_keyframes else ""
-            ring_tag = ""
-            lvsa_tag = (
-                f"_lvsa_w{args.window_size}_f{args.n_first_frames}"
-                f"_kfi{kfi_tag}{rot_tag}{ring_tag}_{backend}"
-            )
-        else:
-            lvsa_tag = "_fullatt"
-        if args.output_name:
-            filename = args.output_name
-            if not filename.endswith(".mp4"):
-                filename += ".mp4"
-        else:
-            stem = os.path.basename(__file__).split(".")[0]
-            model_tag = os.path.basename(args.model)
-            prompt_tag = args.prompt.replace(" ", "_")[:30]
-            filename = (
-                f"{stem}"
-                f"_{model_tag}"
-                f"_gpu{world}"
-                f"_{args.height}x{args.width}@{args.fps}"
-                f"_frames{args.num_frames}"
-                f"{lvsa_tag}"
-                f"_steps{args.steps}_cfg{args.guidance}"
-                f"_seed{args.seed}"
-                f"_dur{gen_duration:.0f}s_mem{mem_mb:.0f}MB"
-                f"_{prompt_tag}"
-                f".mp4"
-            )
-        out_path = os.path.join(args.output_dir, filename)
+        out_path = build_output_path(args, world, gen_duration, mem_mb,
+                                     stem="cogvideox_generate", ext="mp4")
         os.makedirs(args.output_dir, exist_ok=True)
 
         t_exp = time.time()

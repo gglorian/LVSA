@@ -67,20 +67,71 @@ class Cosmos3LVSAAttnProcessor:
 
     def __init__(self, total_latent_frames, num_patches, reference_latent_frames,
                  window_size=12, n_first_frames=4, sparsity_scale=1.0,
-                 attention_backend=None):
+                 key_frame_interval=None, expand_window: bool = True,
+                 attention_backend=None, use_flashinfer: bool = False):
         self.P = num_patches
         self.attention_backend = attention_backend
+        self.use_flashinfer = bool(use_flashinfer)
+        if self.use_flashinfer:
+            from lvsa.cosmos_flashinfer import FLASHINFER_AVAILABLE
+            if not FLASHINFER_AVAILABLE:
+                import warnings
+                warnings.warn("use_flashinfer=True but flashinfer is unavailable; "
+                              "falling back to SDPA.", RuntimeWarning)
+                self.use_flashinfer = False
         # video-frame knobs -> latent-frame knobs (VAE temporal 4)
         w = max(1, window_size // _VAE_TEMPORAL)
         nf = max(1, n_first_frames // _VAE_TEMPORAL)
-        kfi = compute_auto_kfi(total_latent_frames, w, nf,
-                               reference_frames=reference_latent_frames,
-                               sparsity_scale=sparsity_scale)
+        if key_frame_interval is not None:
+            kfi = key_frame_interval
+        else:
+            kfi = compute_auto_kfi(total_latent_frames, w, nf,
+                                   reference_frames=reference_latent_frames,
+                                   sparsity_scale=sparsity_scale)
         self.metadata = LVSAMetadata.build(
             total_latent_frames=total_latent_frames, num_patches=num_patches,
             window_size=w, n_first_frames=nf, key_frame_interval=kfi,
-            rank=0, world=1, expand_window=True,
+            rank=0, world=1, expand_window=expand_window,
             reference_frames=reference_latent_frames, sparsity_scale=sparsity_scale,
+        )
+        # Store build params for print_attention_mask_compact() and set_step()
+        self.total_latent_frames = total_latent_frames
+        self.window_lat = w
+        self.n_first_lat = nf
+        self.key_frame_interval = kfi
+        self.reference_latent_frames = reference_latent_frames
+        self.sparsity_scale = sparsity_scale
+        self._expand_window = expand_window
+        self._current_offset = 0
+
+    def print_attention_mask_compact(self) -> None:
+        """Compact 1-char-per-column attention mask for narrow terminals.
+        Delegates to the free function in ``lvsa.sparse_attention``.
+        """
+        from .sparse_attention import print_attention_mask_compact as _print
+        _print(
+            total_frames=self.total_latent_frames,
+            window_size=self.window_lat,
+            global_set=set(self.metadata.global_indices),
+            expand_window=self._expand_window,
+        )
+
+    def set_step(self, step_idx: int) -> None:
+        """Rotate periodic keyframes for this denoising step (mirrors the wan
+        processor): shift the keyframe grid by step_idx % key_frame_interval."""
+        if not self.key_frame_interval:
+            return
+        offset = step_idx % self.key_frame_interval
+        if offset == self._current_offset:
+            return
+        self._current_offset = offset
+        self.metadata = LVSAMetadata.build(
+            total_latent_frames=self.total_latent_frames, num_patches=self.P,
+            window_size=self.window_lat, n_first_frames=self.n_first_lat,
+            key_frame_interval=self.key_frame_interval, rank=0, world=1,
+            expand_window=self._expand_window, keyframe_offset=offset,
+            reference_frames=self.reference_latent_frames,
+            sparsity_scale=self.sparsity_scale,
         )
 
     def __call__(self, attn, und_seq, gen_seq, rotary_emb):
@@ -138,8 +189,12 @@ class Cosmos3LVSAAttnProcessor:
         # und is always-global -> append after the gen anchors
         kglob = torch.cat([kglob, k_und.unsqueeze(0)], dim=1)
         vglob = torch.cat([vglob, v_und.unsqueeze(0)], dim=1)
-        out = lvsa_sdpa(qg, kg, vg, kglob, vglob, self.metadata,
-                        attention_backend=self.attention_backend)
+        if self.use_flashinfer:
+            from lvsa.cosmos_flashinfer import get_shared_runner
+            out = get_shared_runner().run(qg, kg, vg, kglob, vglob, self.metadata)
+        else:
+            out = lvsa_sdpa(qg, kg, vg, kglob, vglob, self.metadata,
+                            attention_backend=self.attention_backend)
         gen_out = attn.to_add_out(out.squeeze(0).flatten(-2, -1))
         return und_out, gen_out
 
@@ -147,11 +202,15 @@ class Cosmos3LVSAAttnProcessor:
 def install_cosmos3_lvsa(transformer, num_frames, height, width,
                          window_size=12, n_first_frames=4, sparsity_scale=1.0,
                          reference_latent_frames=COSMOS3_REFERENCE_LATENT_FRAMES,
-                         attention_backend=None):
+                         key_frame_interval=None, expand_window: bool = True,
+                         attention_backend=None, use_flashinfer: bool = False):
     """Swap every layer's self-attn processor with the LVSA gen-pathway version.
 
-    Returns the number of layers patched. Single-GPU only (world=1). All layers
-    share one processor (same geometry); the processor is stateless per call.
+    Returns the shared ``Cosmos3LVSAAttnProcessor`` handle (all layers share
+    one instance). Callers can use the returned handle to call
+    ``proc.set_step()``, ``proc.print_attention_mask_compact()``, etc.
+    Single-GPU only (world=1). All layers share one processor (same geometry);
+    the processor is stateless per call.
     """
     T_lat = cosmos3_latent_frames(num_frames)
     P = cosmos3_patches_per_frame(height, width)
@@ -159,7 +218,9 @@ def install_cosmos3_lvsa(transformer, num_frames, height, width,
         total_latent_frames=T_lat, num_patches=P,
         reference_latent_frames=reference_latent_frames,
         window_size=window_size, n_first_frames=n_first_frames,
-        sparsity_scale=sparsity_scale, attention_backend=attention_backend,
+        sparsity_scale=sparsity_scale, key_frame_interval=key_frame_interval,
+        expand_window=expand_window,
+        attention_backend=attention_backend, use_flashinfer=use_flashinfer,
     )
     n = 0
     for layer in transformer.layers:
@@ -177,4 +238,4 @@ def install_cosmos3_lvsa(transformer, num_frames, height, width,
         print(f"[LVSA] Cosmos3: installed on {n} layers  T_lat={T_lat} P={P}  "
               f"kfi={proc.metadata.key_frame_interval} "
               f"globals={len(proc.metadata.global_indices)}")
-    return n
+    return proc

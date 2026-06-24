@@ -63,8 +63,13 @@ def install_cosmos3_lvsa_hook(total_latent_frames: int) -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
         Cosmos3CrossAttention,
         _apply_rotary_pos_emb,
-        _is_sp_active,
     )
+
+    # Single point of truth for the SP signal: ._sp.is_sp_active reads the same
+    # forward_context.sp_active that Cosmos3's transformer-local _is_sp_active
+    # uses (see _sp.py docstring), so this is behaviorally equivalent but keeps
+    # all three hooks (wan/hunyuan/cosmos) gating through one shared helper.
+    from ._sp import is_sp_active as _is_sp_active
 
     config = LVSAConfig.from_env()
     state = HunyuanLVSAState(config)
@@ -133,6 +138,15 @@ def install_cosmos3_lvsa_hook(total_latent_frames: int) -> None:
                 reason="sequence_parallel",
                 seq_len=S_gen,
                 extra={"step": step_idx},
+                # Cosmos3CrossAttention.forward routes through self.attn =
+                # FrameworkAttention, with an SP-aware _forward_sp (joint_key/value
+                # + Ulysses all-to-all). So this does NOT reimplement dense — it
+                # delegates to that framework attention, which computes correct
+                # full attention under SP. (Whether LVSA *sparsity* re-engages
+                # there depends on self.attn being the LVSA backend AND the
+                # backend handling Cosmos's separate-stream joint K/V — UNVERIFIED,
+                # unlike Wan/Hunyuan where the hand-off to the backend is proven.)
+                action="delegating to self.attn (framework attention; SP-aware joint path)",
             )
             return _orig_forward(self, hidden_states, k_und, v_und, freqs_cos, freqs_sin)
 
@@ -145,6 +159,9 @@ def install_cosmos3_lvsa_hook(total_latent_frames: int) -> None:
                 reason="geometry_mismatch",
                 seq_len=S_gen,
                 extra={"step": step_idx, "T_lat": total_latent_frames},
+                # Delegates to Cosmos3CrossAttention.forward → self.attn
+                # (FrameworkAttention), not a dense reimpl.
+                action="delegating to self.attn (framework attention)",
             )
             return _orig_forward(self, hidden_states, k_und, v_und, freqs_cos, freqs_sin)
         P = S_gen // total_latent_frames
@@ -208,10 +225,6 @@ def install_cosmos3_lvsa_hook(total_latent_frames: int) -> None:
 
     # Apply the monkey-patch.
     Cosmos3CrossAttention.forward = _lvsa_forward
-
-    # Tell the attention impl to just use dense (the hook handles LVSA).
-    from .attention_impl import LVSAAttentionImpl
-    LVSAAttentionImpl._hook_active = True
 
     print(
         f"[LVSA-hook] Installed LVSA hook on Cosmos3CrossAttention "

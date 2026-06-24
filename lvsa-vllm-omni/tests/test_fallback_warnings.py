@@ -32,6 +32,27 @@ def test_warn_fallback_prints(reset_state, capsys):
     assert "k=v" in captured.out
 
 
+def test_warn_fallback_default_action_is_dense(reset_state, capsys):
+    """Without an explicit action, the message still says DENSE (back-compat)."""
+    from lvsa_vllm_omni._fallback import warn_fallback
+    warn_fallback("forward_cuda", "no_t_lat", 100)
+    captured = capsys.readouterr()
+    assert "falling back to DENSE attention" in captured.out
+
+
+def test_warn_fallback_custom_action_overrides_dense(reset_state, capsys):
+    """A delegate-to site (e.g. wan_hook under SP) states its real target,
+    NOT 'DENSE' — the backend re-engages LVSA on the gathered grid."""
+    from lvsa_vllm_omni._fallback import warn_fallback
+    warn_fallback(
+        "wan_hook", "sequence_parallel", 31980,
+        action="delegating to self.attn — LVSA backend RE-ENGAGES (NOT dense)",
+    )
+    captured = capsys.readouterr()
+    assert "LVSA backend RE-ENGAGES" in captured.out
+    assert "falling back to DENSE attention" not in captured.out
+
+
 def test_warn_fallback_deduplicates(reset_state, capsys):
     """Same (origin, reason, seq_len) warns once."""
     from lvsa_vllm_omni._fallback import warn_fallback

@@ -85,9 +85,22 @@ LVSA supports two attention backends. They're selected per-run via CLI / env var
 | Backend | When to use | Install | Hardware |
 |---|---|---|---|
 | **SDPA** (default) | Always available; reasonable on short sequences | included with PyTorch | CUDA, Ascend NPU, CPU |
-| **FlashInfer** | Fastest at `T_lat ≥ 49` (HunyuanVideo 1.5×+, Wan 2×+) | `pip install flashinfer-python flashinfer-cubin` | CUDA only |
+| **FlashInfer** | Fastest at `T_lat ≥ 49` (HunyuanVideo 1.5×+, Wan 2×+) | see below | CUDA only |
 
-If your install doesn't include FlashInfer, runs fall back to SDPA with a warning.
+By default `flashinfer-python` compiles/downloads kernels on first use (JIT). To skip that — faster startup, and on this CUDA-13 stack the runtime JIT can dead-end on a CCCL/nvcc version skew — FlashInfer ships **two distinct optional prebuilt-kernel packages** (they are *not* the same package, nor a rename of one another):
+
+- **`flashinfer-cubin`** — pre-compiled kernel binaries for *all* supported GPU architectures; on PyPI, no special index.
+- **`flashinfer-jit-cache`** — a prebuilt JIT cache for a *specific* CUDA version; served from the FlashInfer index, so you pick the `cuXXX` matching your torch CUDA (e.g. `cu130` for torch 2.11+cu130).
+
+```bash
+uv pip install flashinfer-python
+# (a) all-arch prebuilt binaries (PyPI):
+uv pip install flashinfer-cubin
+# (b) CUDA-version-specific JIT cache (FlashInfer index — match cuXXX to your torch CUDA):
+uv pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
+```
+
+For LVSA specifically, **`flashinfer-jit-cache` (cu130)** is the one that unblocks the vllm-omni plugin's runtime JIT; `flashinfer-cubin` further reduces first-use latency. Both versions must match `flashinfer-python`. If your install doesn't include FlashInfer, runs fall back to SDPA with a warning.
 
 ### Ascend NPU note
 
@@ -124,7 +137,7 @@ Each downloads under its own license — see the model cards.
 | Problem | Fix |
 |---|---|
 | `ModuleNotFoundError: No module named 'lvsa'` | re-run `pip install -e .` from the repo root |
-| `flashinfer not found` warning | install `flashinfer-python flashinfer-cubin`, or rely on SDPA |
+| `flashinfer not found` warning | install `flashinfer-python` + `flashinfer-jit-cache` (`--index-url https://flashinfer.ai/whl/cu130`; optionally also `flashinfer-cubin` from PyPI), or rely on SDPA |
 | FlashInfer install fails | use the SDPA backend (default); FlashInfer is optional |
 | `OSError: libcuda.so.1` | not a CUDA-enabled environment; install NVIDIA drivers + CUDA runtime, OR use Ascend NPU via `torch_npu` |
 | `torch_npu` not importable on Ascend | install Ascend's `torch_npu` matching your CANN + PyTorch version |

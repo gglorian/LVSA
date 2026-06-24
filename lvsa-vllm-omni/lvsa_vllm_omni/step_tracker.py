@@ -50,6 +50,29 @@ def get_num_patches() -> Optional[int]:
     return getattr(_state, "num_patches", None)
 
 
+def native_denoise_step() -> Optional[int]:
+    """The true denoise step from vllm-omni's diffusion ForwardContext, or None
+    if unavailable (older vllm-omni, no active context, or a pipeline that does
+    not publish it — e.g. HunyuanVideo 1.5 / Cosmos in 0.22.0).
+
+    The import is inside the function and guarded so this is a clean no-op under
+    environments without ``vllm_omni`` (e.g. the CPU test env) — returning None
+    so callers fall back to the call-counting heuristic. ``get_forward_context``
+    asserts when no context is active, so we gate on
+    ``is_forward_context_available()`` first.
+    """
+    try:
+        from vllm_omni.diffusion.forward_context import (
+            is_forward_context_available,
+            get_forward_context,
+        )
+        if is_forward_context_available():
+            return get_forward_context().denoise_step_idx
+    except Exception:
+        return None
+    return None
+
+
 def reset() -> None:
     """Clear all tracked state."""
     global _global_tracker

@@ -12,6 +12,7 @@ import os
 import pytest
 
 from lvsa_vllm_omni.config import candidate_patches_per_frame
+from lvsa_vllm_omni.attention_impl import LVSAAttentionImpl
 
 
 @pytest.fixture(autouse=True)
@@ -97,3 +98,57 @@ class TestResolutionDerivation:
         monkeypatch.setenv("LVSA_VIDEO_HEIGHT", "0")
         monkeypatch.setenv("LVSA_VIDEO_WIDTH", "0")
         assert candidate_patches_per_frame() == [1560]
+
+
+def _make_impl():
+    return LVSAAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.125)
+
+
+@pytest.fixture(autouse=True)
+def reset_geometry_log():
+    """Reset the class-level once-guards so log/warning tests are deterministic."""
+    LVSAAttentionImpl._logged_geometry = False
+    LVSAAttentionImpl._logged_geometry_ambiguous = set()
+    yield
+    LVSAAttentionImpl._logged_geometry = False
+    LVSAAttentionImpl._logged_geometry_ambiguous = set()
+
+
+class TestDetectGeometry:
+    def test_single_candidate_picks_it(self):
+        """Default single-candidate set → unchanged behavior."""
+        impl = _make_impl()
+        T, P = 5, 1560
+        seq = T * P + 100  # 100 encoder tokens
+        p, text = impl._detect_geometry(seq, T)
+        assert p == 1560
+        assert text == 100
+
+    def test_zero_match_returns_none(self):
+        """Warmup/dummy seq matching no candidate → (None, None)."""
+        impl = _make_impl()
+        # seq < T_lat * P → text negative for the only candidate (1560)
+        p, text = impl._detect_geometry(7, 5)
+        assert p is None
+        assert text is None
+
+    @pytest.mark.parametrize("ppf_env", ["1560,1000", "1000,1560"])
+    def test_multi_match_picks_smallest_text_deterministically(
+        self, monkeypatch, capsys, ppf_env
+    ):
+        """Multiple candidates match → pick smallest-text, independent of order.
+
+        T=5, seq=8000:
+          P=1560 → video=7800, text=200  (both in [0, video))
+          P=1000 → video=5000, text=3000
+        Smallest text → P=1560, regardless of list order.
+        """
+        monkeypatch.setenv("LVSA_PATCHES_PER_FRAME", ppf_env)
+        impl = _make_impl()
+        p, text = impl._detect_geometry(8000, 5)
+        assert p == 1560
+        assert text == 200
+        out = capsys.readouterr().out
+        assert "ambiguous" in out.lower()
+        # candidates listed in the warning
+        assert "1560" in out and "1000" in out

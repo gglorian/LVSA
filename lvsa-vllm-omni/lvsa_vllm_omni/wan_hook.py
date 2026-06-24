@@ -96,10 +96,25 @@ def install_wan_lvsa_hook(total_latent_frames: int) -> None:
                 seq_len=local_seq,
                 extra={"T_lat": total_latent_frames, "full_seq": full_seq,
                        "sp_active": _sp_active},
+                # This site does NOT go dense — it delegates to self.attn (the
+                # LVSA backend). Under SP the backend re-engages LVSA on the
+                # framework-gathered grid; on a geometry miss the backend's own
+                # geometry check decides (dense only if it also misses).
+                action=(
+                    "delegating to self.attn — LVSA backend RE-ENGAGES on the "
+                    "framework-gathered full grid (NOT dense)"
+                    if _sp_active else
+                    "delegating to self.attn (LVSA backend; dense only if it "
+                    "also fails geometry on the full grid)"
+                ),
             )
-            # Delegate to the original (dense) forward rather than reimplement
-            # the attention call — keeps us correct against vllm-omni's evolving
-            # signature (it builds its own AttentionMetadata from the padding).
+            # Delegate to the original WanSelfAttention.forward rather than
+            # reimplement the attention call — keeps us correct against
+            # vllm-omni's evolving signature (it builds its own AttentionMetadata
+            # from the padding). _orig_forward routes through ``self.attn``,
+            # which under sequence-parallel is the LVSA *backend* running on the
+            # framework-gathered full grid — so this SP path re-ENGAGES LVSA, it
+            # is NOT dense (see the ``action`` above).
             return _orig_forward(self, hidden_states, rotary_emb, attn_metadata)
 
         P = full_seq // total_latent_frames
@@ -162,13 +177,6 @@ def install_wan_lvsa_hook(total_latent_frames: int) -> None:
 
     # Apply the monkey-patch
     WanSelfAttention.forward = _lvsa_forward
-
-    # Let the attention backend know we're handling LVSA at the hook level
-    try:
-        from .attention_impl import LVSAAttentionImpl
-        LVSAAttentionImpl._hook_active = True
-    except Exception:
-        pass
 
     print(
         f"[LVSA-hook] Installed LVSA hook on WanSelfAttention "
