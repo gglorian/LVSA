@@ -67,7 +67,7 @@ This is the single most common LVSA configuration mistake. **Always set explicit
 | Cosmos 3.0 (Nano, experimental) | `48` | 189 (@720p) |
 | CogVideoX 5B | `13` | 49 |
 
-For the standalone example scripts the value is wired automatically by `lvsa/adapters/<model>.py::reference_latent_frames()` (or, for Cosmos 3.0, by the `COSMOS3_REFERENCE_LATENT_FRAMES=48` default in `lvsa/cosmos3.py`). Override only if your fork uses non-default geometry. Cosmos 3.0 standalone runs via `examples/cosmos_generate.py` (single-GPU, SDPA, needs diffusers main); the plugin path (`lvsa-vllm-omni` skill) additionally gives Cosmos FlashInfer + multi-GPU (TP/CFG/PP/HSDP).
+For the standalone example scripts the value is wired automatically by `lvsa/adapters/<model>.py::reference_latent_frames()` (or, for Cosmos 3.0, by the `COSMOS3_REFERENCE_LATENT_FRAMES=48` default in `lvsa/cosmos3.py`). Override only if your fork uses non-default geometry. Cosmos 3.0 standalone runs via `examples/cosmos_generate.py` (single-GPU, SDPA, needs diffusers>=0.39); the plugin path (`lvsa-vllm-omni` skill) additionally gives Cosmos FlashInfer + multi-GPU (TP/CFG/PP/HSDP).
 
 ## Run a first generation
 

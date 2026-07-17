@@ -14,8 +14,8 @@ QA we run before tagging a release.
 
 ## Prerequisites
 
-- The `lvsa-vllm-omni` plugin venv with `vllm==0.22.0` (PyPI) and
-  `vllm-omni==0.22.0` (built from the git tag `@v0.22.0`; symmetric pairing).
+- The `lvsa-vllm-omni` plugin venv with `vllm==0.24.0` (PyPI) and
+  `vllm-omni==0.24.0rc1` (built from the git tag `@v0.24.0rc1`; symmetric pairing).
   See [`../examples/README.md`](../examples/README.md) for the setup.
   The sweep expects `$ROOT/.venv-vllm/bin/python` by default; override with
   `PYTHON_VENV=...`.

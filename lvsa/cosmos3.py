@@ -68,7 +68,8 @@ class Cosmos3LVSAAttnProcessor:
     def __init__(self, total_latent_frames, num_patches, reference_latent_frames,
                  window_size=12, n_first_frames=4, sparsity_scale=1.0,
                  key_frame_interval=None, expand_window: bool = True,
-                 attention_backend=None, use_flashinfer: bool = False):
+                 attention_backend=None, use_flashinfer: bool = False,
+                 condition_latent_frames=None):
         self.P = num_patches
         self.attention_backend = attention_backend
         self.use_flashinfer = bool(use_flashinfer)
@@ -88,10 +89,15 @@ class Cosmos3LVSAAttnProcessor:
             kfi = compute_auto_kfi(total_latent_frames, w, nf,
                                    reference_frames=reference_latent_frames,
                                    sparsity_scale=sparsity_scale)
+        # V2V/I2V conditioning latent-frame indices forced into the global set
+        # every step (re-injected reference anchors must stay globally attended,
+        # independent of n_first). None/[] -> plain T2V (no-op).
+        self.condition_latent_frames = list(condition_latent_frames or [])
         self.metadata = LVSAMetadata.build(
             total_latent_frames=total_latent_frames, num_patches=num_patches,
             window_size=w, n_first_frames=nf, key_frame_interval=kfi,
             rank=0, world=1, expand_window=expand_window,
+            condition_frames=self.condition_latent_frames,
             reference_frames=reference_latent_frames, sparsity_scale=sparsity_scale,
         )
         # Store build params for print_attention_mask_compact() and set_step()
@@ -130,6 +136,7 @@ class Cosmos3LVSAAttnProcessor:
             window_size=self.window_lat, n_first_frames=self.n_first_lat,
             key_frame_interval=self.key_frame_interval, rank=0, world=1,
             expand_window=self._expand_window, keyframe_offset=offset,
+            condition_frames=self.condition_latent_frames,
             reference_frames=self.reference_latent_frames,
             sparsity_scale=self.sparsity_scale,
         )
@@ -144,11 +151,23 @@ class Cosmos3LVSAAttnProcessor:
         # lazy diffusers import below, so it is unit-testable on release
         # diffusers (see test_gen_geometry_mismatch_raises).
         S_gen = gen_seq.shape[-2] if gen_seq.ndim == 3 else gen_seq.shape[0]
-        expected = self.metadata.total_latent_frames * self.P
-        if S_gen != expected:
+        video_len = self.metadata.total_latent_frames * self.P
+        # Action-conditioned runs (forward_dynamics / policy / sound) append a
+        # small tail of action/sound tokens AFTER the T_lat*P video grid:
+        # S_gen = video_len + s_extra (measured: s_extra == chunk_size for a
+        # camera_pose forward_dynamics run). Those tokens are not part of the
+        # frame grid, so LVSA windows ONLY the leading video tokens and treats
+        # the tail as always-global K/V (exactly like the und stream); the tail
+        # queries get dense full attention (they are few). s_extra == 0 is the
+        # plain T2V/I2V path (unchanged). A negative delta, or a tail larger
+        # than the video itself, is a genuine geometry error (resolution / VAE
+        # drift) and still raises loudly.
+        s_extra = S_gen - video_len
+        if s_extra < 0 or s_extra > video_len:
             raise ValueError(
-                f"Cosmos3 gen seq length {S_gen} != T_lat*P ({expected}; "
-                f"T_lat={self.metadata.total_latent_frames}, P={self.P}). "
+                f"Cosmos3 gen seq length {S_gen} != T_lat*P ({video_len}; "
+                f"T_lat={self.metadata.total_latent_frames}, P={self.P}) "
+                f"+ a plausible action/sound tail (got delta {s_extra}). "
                 "Geometry mismatch — check num_frames/height/width vs the model."
             )
         # NOTE: mirrors diffusers Cosmos3AttnProcessor internals (private _rotate_half + projection attr names); re-verify on diffusers bump.
@@ -182,19 +201,39 @@ class Cosmos3LVSAAttnProcessor:
         ).squeeze(0).flatten(-2, -1)
         und_out = attn.to_out(causal_out)
 
-        # gen pathway: LVSA (replaces dense full-attn)
-        qg = q_gen.unsqueeze(0)            # [1, S_gen, H, D]
-        kg, vg = k_gen.unsqueeze(0), v_gen.unsqueeze(0)
+        # gen pathway: LVSA on the video grid; action/sound tail = always-global
+        qg_full = q_gen.unsqueeze(0)            # [1, S_gen, H, D]
+        kg_full, vg_full = k_gen.unsqueeze(0), v_gen.unsqueeze(0)
+        # Window only the leading T_lat*P video tokens.
+        qg = qg_full[:, :video_len]
+        kg, vg = kg_full[:, :video_len], vg_full[:, :video_len]
         kglob, vglob = build_global_kv(kg, vg, self.metadata.global_indices, self.P)
-        # und is always-global -> append after the gen anchors
+        # und is always-global -> append after the gen anchors.
         kglob = torch.cat([kglob, k_und.unsqueeze(0)], dim=1)
         vglob = torch.cat([vglob, v_und.unsqueeze(0)], dim=1)
+        # Action/sound tail: also always-global for the video queries.
+        if s_extra:
+            kglob = torch.cat([kglob, kg_full[:, video_len:]], dim=1)
+            vglob = torch.cat([vglob, vg_full[:, video_len:]], dim=1)
         if self.use_flashinfer:
             from lvsa.cosmos_flashinfer import get_shared_runner
-            out = get_shared_runner().run(qg, kg, vg, kglob, vglob, self.metadata)
+            out_vid = get_shared_runner().run(qg, kg, vg, kglob, vglob, self.metadata)
         else:
-            out = lvsa_sdpa(qg, kg, vg, kglob, vglob, self.metadata,
-                            attention_backend=self.attention_backend)
+            out_vid = lvsa_sdpa(qg, kg, vg, kglob, vglob, self.metadata,
+                                attention_backend=self.attention_backend)
+        if s_extra:
+            # Action/sound QUERIES (few) get dense full attention over the whole
+            # gen stream + und, mirroring the dense model for those rows.
+            q_ex = qg_full[:, video_len:]
+            k_all = torch.cat([kg_full, k_und.unsqueeze(0)], dim=1)
+            v_all = torch.cat([vg_full, v_und.unsqueeze(0)], dim=1)
+            out_ex = dispatch_attention_fn(
+                q_ex, k_all, v_all, is_causal=False, enable_gqa=True,
+                backend=self.attention_backend,
+            )
+            out = torch.cat([out_vid, out_ex], dim=1)   # [1, S_gen, H, D]
+        else:
+            out = out_vid
         gen_out = attn.to_add_out(out.squeeze(0).flatten(-2, -1))
         return und_out, gen_out
 
@@ -203,7 +242,8 @@ def install_cosmos3_lvsa(transformer, num_frames, height, width,
                          window_size=12, n_first_frames=4, sparsity_scale=1.0,
                          reference_latent_frames=COSMOS3_REFERENCE_LATENT_FRAMES,
                          key_frame_interval=None, expand_window: bool = True,
-                         attention_backend=None, use_flashinfer: bool = False):
+                         attention_backend=None, use_flashinfer: bool = False,
+                         condition_latent_frames=None):
     """Swap every layer's self-attn processor with the LVSA gen-pathway version.
 
     Returns the shared ``Cosmos3LVSAAttnProcessor`` handle (all layers share
@@ -221,6 +261,7 @@ def install_cosmos3_lvsa(transformer, num_frames, height, width,
         sparsity_scale=sparsity_scale, key_frame_interval=key_frame_interval,
         expand_window=expand_window,
         attention_backend=attention_backend, use_flashinfer=use_flashinfer,
+        condition_latent_frames=condition_latent_frames,
     )
     n = 0
     for layer in transformer.layers:

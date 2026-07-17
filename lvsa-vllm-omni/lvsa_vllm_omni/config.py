@@ -2,7 +2,7 @@
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 # ── LVSA_CFG_PASSES ──────────────────────────────────────────────────────────
@@ -48,6 +48,13 @@ class LVSAConfig:
     # (Wan 1.3B/14B = 21; HunyuanVideo 1.5 = 33). Determines the per-query
     # attention budget at ≤ reference and must match the model to avoid
     # accidental sparsity when T_lat <= this value.
+    condition_latent_frames: list[int] = field(default_factory=list)
+    # V2V/I2V conditioning LATENT-frame indices (e.g. Cosmos 3's
+    # ``condition_frame_indexes_vision`` default ``[0, 1]``). Forced into the
+    # sparse global set every step so the re-injected reference anchors are
+    # always globally attended — independent of ``n_first_frames``. Empty (the
+    # default) is a no-op for plain T2V. Set via ``LVSA_CONDITION_LATENT_FRAMES``
+    # to match the pipeline's actual conditioning indices.
 
     @classmethod
     def from_env(cls) -> "LVSAConfig":
@@ -78,6 +85,19 @@ class LVSAConfig:
         def _str(key: str, default: str) -> str:
             return os.environ.get(key, default)
 
+        def _int_list(key: str) -> list[int]:
+            raw = os.environ.get(key, "")
+            out: list[int] = []
+            for tok in raw.split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                try:
+                    out.append(int(tok))
+                except ValueError:
+                    continue  # skip malformed tokens rather than crash the worker
+            return out
+
         total_lat = os.environ.get("LVSA_TOTAL_LATENT_FRAMES")
 
         return cls(
@@ -92,6 +112,7 @@ class LVSAConfig:
             total_latent_frames=int(total_lat) if total_lat else None,
             sparsity_scale=_float("LVSA_SPARSITY_SCALE", 1.0),
             reference_latent_frames=_int("LVSA_REFERENCE_LATENT_FRAMES", 21),
+            condition_latent_frames=_int_list("LVSA_CONDITION_LATENT_FRAMES"),
         )
 
     @classmethod
@@ -128,11 +149,11 @@ class LVSAConfig:
 #
 # NOTE: ``LVSA_VAE_SPATIAL_FACTOR`` defaults to 8 (Wan/HunyuanVideo). Cosmos 3.0
 # uses spatial factor **16**, not 8, so resolution-derived P would be WRONG for
-# Cosmos. In practice Cosmos engages via ``cosmos3_hook``, which computes
-# ``P = video_seq // T_lat`` directly — bypassing this derivation entirely — so
-# the default-8 mismatch does not bite there. Only if you ever route Cosmos
-# through the generic backend (not the hook) must you set
-# ``LVSA_PATCHES_PER_FRAME`` explicitly (or LVSA_VAE_SPATIAL_FACTOR=16).
+# Cosmos. In practice Cosmos engages via the ``cosmos3_backend`` seam-swap,
+# which computes ``P = video_seq // T_lat`` directly — bypassing this
+# derivation entirely — so the default-8 mismatch does not bite there. Only if
+# you ever route Cosmos through the generic backend without that derivation
+# must you set ``LVSA_PATCHES_PER_FRAME`` explicitly (or LVSA_VAE_SPATIAL_FACTOR=16).
 
 _DEFAULT_PPF = 1560
 

@@ -29,8 +29,7 @@ def main():
         # Insert --omni after "serve"
         sys.argv.insert(2, "--omni")
 
-    # Select LVSA for the self-attention role (vllm-omni 0.22 replaced the
-    # DIFFUSION_ATTENTION_BACKEND env var with the per-role AttentionConfig).
+    # Select LVSA for the self-attention role via the per-role AttentionConfig.
     # Skip if the user already passed their own attention-backend flag.
     # Match the bare flag, the value-attached ``=`` form, and the dotted
     # per-key form (e.g. ``--diffusion-attention-config.per_role...``) for each

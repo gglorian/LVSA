@@ -28,9 +28,13 @@ def register_lvsa_backend():
        dual-stream LVSA.
     3. If ``LVSA_WAN_HOOK=1``, patch ``WanSelfAttention`` for LVSA on
        pre-sharded sequences.
+    4. If ``LVSA_COSMOS3_BACKEND=1``, swap the LVSA backend onto
+       ``Cosmos3CrossAttention.attn`` (engages sparse single-GPU and under
+       Ulysses SP; GPU-verified).
 
-    Multi-GPU (Ring SP / Ulysses SP) falls through to vllm-omni's default
-    parallel attention path; LVSA's per-rank LVSA pattern is not applied at
+    The Cosmos backend engages LVSA under Ulysses (the framework gathers the
+    full grid before the backend). Ring SP still falls through to vllm-omni's
+    default parallel attention path — LVSA's per-rank pattern is not applied at
     ring degree > 1 in this release.
     """
     from aenum import extend_enum
@@ -57,7 +61,7 @@ def register_lvsa_backend():
     # and a no-op if the trigger is not set.
     maybe_install_hunyuan_hook()
     maybe_install_wan_hook()
-    maybe_install_cosmos3_hook()
+    maybe_install_cosmos3_backend()
 
 
 def maybe_install_hunyuan_hook():
@@ -108,26 +112,30 @@ def maybe_install_wan_hook():
         print(f"[LVSA] Wan hook installation failed: {e}")
 
 
-def maybe_install_cosmos3_hook():
-    """Install NVIDIA Cosmos 3 LVSA hook if LVSA_COSMOS3_HOOK=1.
+def maybe_install_cosmos3_backend():
+    """Install the Cosmos 3 LVSA backend seam-swap if LVSA_COSMOS3_BACKEND=1.
 
-    Patches ``Cosmos3CrossAttention`` (the diffusion/generation pathway) at the
-    class level so the gen video stream uses sparse LVSA while the understanding
-    (text/VLM) K/V are appended as always-attended globals.
+    Patches ``Cosmos3CrossAttention.__init__`` to swap the gen seam's resolved
+    attention impl for a cosmos-gen-marked ``LVSAAttentionImpl``. Engages
+    sparse LVSA on single-GPU AND under Ulysses (the framework gathers the
+    full grid before the backend).
 
-    Must be called before the model is instantiated. Cosmos 3 lives only in
-    vllm-omni main (not in any tagged release yet), so the import is guarded.
-    Reads total_latent_frames from LVSA_TOTAL_LATENT_FRAMES at forward time.
+    Must be called before the model is instantiated. Reads total_latent_frames
+    from LVSA_TOTAL_LATENT_FRAMES env var at install time.
     """
-    if os.environ.get("LVSA_COSMOS3_HOOK", "").lower() not in ("1", "true", "yes"):
+    if os.environ.get("LVSA_COSMOS3_BACKEND", "").lower() not in ("1", "true", "yes"):
         return
 
     try:
-        from lvsa_vllm_omni.cosmos3_hook import install_cosmos3_lvsa_hook
+        from lvsa_vllm_omni.cosmos3_backend import install_cosmos3_lvsa_backend
         T_lat = os.environ.get("LVSA_TOTAL_LATENT_FRAMES")
+        P_env = os.environ.get("LVSA_PATCHES_PER_FRAME")
+        num_patches = int(P_env) if P_env else None
         if T_lat:
-            install_cosmos3_lvsa_hook(total_latent_frames=int(T_lat))
+            install_cosmos3_lvsa_backend(
+                total_latent_frames=int(T_lat), num_patches=num_patches,
+            )
         else:
-            print("[LVSA] Warning: LVSA_COSMOS3_HOOK=1 but LVSA_TOTAL_LATENT_FRAMES not set")
+            print("[LVSA] Warning: LVSA_COSMOS3_BACKEND=1 but LVSA_TOTAL_LATENT_FRAMES not set")
     except Exception as e:
-        print(f"[LVSA] Cosmos3 hook installation failed: {e}")
+        print(f"[LVSA] Cosmos3 backend installation failed: {e}")

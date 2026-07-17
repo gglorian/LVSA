@@ -26,10 +26,9 @@ DTYPE=${DTYPE:-bfloat16}
 TP=${TP:-1}
 
 # ── LVSA backend selection ───────────────────────────────────────────────────
-# vllm-omni 0.22 dropped the DIFFUSION_ATTENTION_BACKEND env var; the
-# `lvsa_vllm_omni.serve` wrapper below injects the equivalent per-role
-# AttentionConfig (--diffusion-attention-config) automatically.
-export LVSA_WAN_HOOK=1
+# The `lvsa_vllm_omni.serve` wrapper below injects the per-role AttentionConfig
+# (--diffusion-attention-config) automatically — the backend drives the sparse
+# attention; no LVSA_WAN_HOOK needed (the hook is a legacy fallback only).
 export LVSA_REFERENCE_LATENT_FRAMES=${LVSA_REFERENCE_LATENT_FRAMES:-21}
 export LVSA_TOTAL_LATENT_FRAMES=${LVSA_TOTAL_LATENT_FRAMES:-21}
 export LVSA_AUTO_KEYFRAMES=${LVSA_AUTO_KEYFRAMES:-1}

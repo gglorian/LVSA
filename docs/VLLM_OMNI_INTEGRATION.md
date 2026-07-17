@@ -39,14 +39,14 @@ lvsa-vllm-omni/
 
 ```bash
 pip install -e lvsa-vllm-omni/
-# vllm-omni 0.22.0 is a stable release — install it from the git tag to match
-# vllm 0.22.0.
-pip install "vllm==0.22.0"
+# vllm-omni 0.24.0rc1 is a release candidate — install it from the git tag to match
+# vllm 0.24.0.
+pip install "vllm==0.24.0"
 pip install --no-build-isolation \
-  "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.22.0"
+  "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.24.0rc1"
 
-# vllm-omni 0.22 selects the attention backend per role via AttentionConfig
-# (the DIFFUSION_ATTENTION_BACKEND env var was removed). The `python -m
+# vllm-omni 0.22 selects the attention backend per role via AttentionConfig.
+# The `python -m
 # lvsa_vllm_omni.serve` wrapper injects this flag for you; the raw form is:
 
 # Enable for HunyuanVideo — the backend alone is sufficient (preferred path)
@@ -64,8 +64,10 @@ vllm serve --omni --model Wan2.2-T2V-14B \
 # The monkey-patch hooks (LVSA_WAN_HOOK=1 / LVSA_HUNYUAN_HOOK=1) are an
 # ALTERNATIVE to the backend, not a prerequisite. Prefer the backend: it runs
 # after the framework all-to-all, so it stays sparse under Ulysses
-# sequence-parallel, where the hooks fall back to dense. Cosmos 3.0 is the
-# exception — it has no backend path and engages via LVSA_COSMOS3_HOOK=1.
+# sequence-parallel, where the hooks fall back to dense. Cosmos 3.0 engages
+# the same way via its own backend seam-swap: LVSA_COSMOS3_BACKEND=1 installs
+# LVSA on Cosmos3CrossAttention's resolved attention backend, engaging sparse
+# both single-GPU and under Ulysses (GPU-verified 2026-07-07).
 ```
 
 The plugin entry point in `pyproject.toml` registers `lvsa_vllm_omni:register` under `vllm_omni.general_plugins`, which fires at vLLM-Omni startup.

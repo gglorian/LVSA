@@ -122,6 +122,41 @@ class TestLVSAMetadataBuild:
         for g in guards:
             assert g in m.global_set
 
+    def test_condition_frames_forced_global(self):
+        # Conditioning latent frames must land in the global set EVEN when
+        # n_first/kfi would otherwise skip them. n_first=1,kfi=4 -> frame 1 is
+        # NOT a periodic keyframe, so without condition_frames it is windowed,
+        # not global. This is exactly the V2V cond-frame-dropout bug.
+        m = LVSAMetadata.build(
+            total_latent_frames=100, num_patches=30, window_size=3,
+            n_first_frames=1, key_frame_interval=4,
+            rank=0, world=1, condition_frames=[0, 1],
+        )
+        assert 0 in m.global_set
+        assert 1 in m.global_set  # would be absent without condition_frames
+
+    def test_condition_frames_out_of_range_filtered(self):
+        # Indices >= T or < 0 are dropped (never indexed into the frame grid).
+        m = LVSAMetadata.build(
+            total_latent_frames=10, num_patches=30, window_size=3,
+            n_first_frames=1, key_frame_interval=4,
+            rank=0, world=1, condition_frames=[1, 10, 99, -1],
+        )
+        assert 1 in m.global_set
+        assert 10 not in m.global_set
+        assert 99 not in m.global_set
+        assert all(0 <= g < 10 for g in m.global_indices)
+
+    def test_condition_frames_default_none_unchanged(self):
+        # Omitting condition_frames reproduces the pre-existing global set.
+        base = self._build(T=100, n_first=1, kfi=4)
+        same = LVSAMetadata.build(
+            total_latent_frames=100, num_patches=30, window_size=3,
+            n_first_frames=1, key_frame_interval=4,
+            rank=0, world=1, condition_frames=None,
+        )
+        assert base.global_indices == same.global_indices
+
     def test_keyframe_offset_rotation(self):
         m0 = self._build()
         m1 = LVSAMetadata.build(

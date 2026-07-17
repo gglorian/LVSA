@@ -16,7 +16,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.9.22 /uv /uvx /bin/
 RUN --mount=type=cache,target=/root/.cache/uv \
         uv venv --python 3.12 /venv --seed
 
-# ── Torch 2.11 / CUDA 13 (matches vllm 0.22.0's pin) ──
+# ── Torch 2.11 / CUDA 13 (matches vllm 0.24.0's pin) ──
 RUN --mount=type=cache,target=/root/.cache/uv \
         uv pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
         --index-url https://download.pytorch.org/whl/cu130
@@ -42,13 +42,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-cache-dir "git+https://github.com/huggingface/diffusers.git@main#egg=diffusers[test]"
 
 # ── vllm (PyPI) + vllm-omni (git tag) ──
-# vllm-omni 0.22.0 is a stable release — build it from the git tag to match
-# vllm 0.22.0. Install vllm first — vllm-omni does not declare vllm as a dependency.
+# vllm-omni 0.24.0rc1 is a release candidate — build it from the git tag to match
+# vllm 0.24.0. Install vllm first — vllm-omni does not declare vllm as a dependency.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install "vllm==0.22.0"
+    uv pip install "vllm==0.24.0"
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-build-isolation \
-    "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.22.0"
+    "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.24.0rc1"
 
 # ── NO flash_attn — torch SDPA dispatches to FA2 internally ──
 

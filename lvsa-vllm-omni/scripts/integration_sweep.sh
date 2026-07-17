@@ -32,7 +32,7 @@ cd "$ROOT"
 
 # This sweep targets the vllm-omni-pinned venv (`.venv-vllm`), not the
 # standalone-engine venv (`.venv`).  The two venvs have incompatible torch
-# pins: vllm-omni 0.22.0 (+ vllm 0.22.0) require torch 2.11 / CUDA 13 while
+# pins: vllm-omni 0.24.0rc1 (+ vllm 0.24.0) require torch 2.11 / CUDA 13 while
 # the standalone engine uses torch 2.12.  See lvsa-vllm-omni/examples/README.md.
 PYTHON_VENV=${PYTHON_VENV:-$ROOT/.venv-vllm}
 PYTHON="$PYTHON_VENV/bin/python"
@@ -43,9 +43,9 @@ if [ ! -x "$PYTHON" ]; then
   echo "Create the vllm-omni venv first:" >&2
   echo "  uv venv .venv-vllm --python 3.12" >&2
   echo "  source .venv-vllm/bin/activate" >&2
-  echo "  uv pip install -e . -e lvsa-vllm-omni/ \"vllm==0.22.0\"" >&2
+  echo "  uv pip install -e . -e lvsa-vllm-omni/ \"vllm==0.24.0\"" >&2
   echo "  uv pip install --no-build-isolation \\" >&2
-  echo "      'vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.22.0'" >&2
+  echo "      'vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.24.0rc1'" >&2
   exit 1
 fi
 

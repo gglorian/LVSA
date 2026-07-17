@@ -57,13 +57,14 @@ def _rope_tuple(s_und, s_gen, head_dim):
 
 # NOTE (CI coverage): the two tests below — the 1x==dense equivalence and the
 # sparse-engagement check — are the only ones that exercise the actual processor
-# *numerics*, and both importorskip on diffusers main. CI runs release diffusers,
-# so CI does NOT cover the gen/und attention math; it covers only geometry, the
-# batched guard, the geometry-mismatch guard, and the installer. A green CI does
-# not certify the processor numerics — run these locally on diffusers main (or a
-# scheduled main-pinned job) after any change to the attention path.
+# *numerics*. They importorskip on the diffusers Cosmos3 transformer.
+# As of diffusers 0.39.0 (released 2026-07-03) Cosmos3 ships in a RELEASE, and our
+# `[diffusers]` extra (`>=0.31`) resolves to it — so these tests now RUN in CI and a
+# green CI DOES cover the gen/und attention math. The importorskip stays for envs
+# pinned below 0.39 (notably any env with vllm-omni, which pins diffusers==0.38.0),
+# where they skip rather than error.
 def test_lvsa_processor_matches_dense_at_1x():
-    # Cosmos3 lives in diffusers main only — skip on release diffusers (e.g. CI).
+    # Cosmos3 ships in diffusers >=0.39.0; skip only on older pins (e.g. vllm-omni's 0.38.0).
     pytest.importorskip("diffusers.models.transformers.transformer_cosmos3")
     from diffusers.models.transformers.transformer_cosmos3 import Cosmos3AttnProcessor
     from lvsa.cosmos3 import Cosmos3LVSAAttnProcessor
@@ -80,6 +81,34 @@ def test_lvsa_processor_matches_dense_at_1x():
     my_und, my_gen = proc(attn, und, gen, rot)
     assert torch.allclose(my_und, ref_und, atol=1e-5), "und path must be untouched"
     assert torch.allclose(my_gen, ref_gen, atol=1e-5), "gen LVSA must == dense at 1x"
+
+
+def test_lvsa_processor_matches_dense_with_action_tokens():
+    """Action-conditioned runs (forward_dynamics/policy/sound) append a tail of
+    non-video tokens after the T_lat*P video grid. At 1x horizon (window covers
+    all video) the gen pathway is full attention, so the split — video queries =
+    LVSA(video) + und/action-as-global, action queries = dense full — must equal
+    the NATIVE dense processor EXACTLY for every row (video AND action)."""
+    pytest.importorskip("diffusers.models.transformers.transformer_cosmos3")
+    from diffusers.models.transformers.transformer_cosmos3 import Cosmos3AttnProcessor
+    from lvsa.cosmos3 import Cosmos3LVSAAttnProcessor
+    torch.manual_seed(0)
+    T_lat, P, head_dim, s_extra = 6, 2, 16, 3   # 3 trailing action/sound tokens
+    attn = _FakeCosmosAttn(head_dim=head_dim).eval()
+    und = torch.randn(5, 64)
+    gen = torch.randn(T_lat * P + s_extra, 64)  # video grid + action tail
+    rot = _rope_tuple(5, T_lat * P + s_extra, head_dim)
+    ref_und, ref_gen = Cosmos3AttnProcessor()(attn, und, gen, rot)
+    proc = Cosmos3LVSAAttnProcessor(total_latent_frames=T_lat, num_patches=P,
+                                    reference_latent_frames=T_lat)  # 1x -> window all
+    my_und, my_gen = proc(attn, und, gen, rot)
+    assert my_gen.shape == ref_gen.shape == (T_lat * P + s_extra, 64)
+    assert torch.allclose(my_und, ref_und, atol=1e-5), "und path must be untouched"
+    # video rows AND the action tail rows must each equal native dense full-attn.
+    assert torch.allclose(my_gen, ref_gen, atol=1e-5), (
+        "action-token split must == dense at 1x (window-all). "
+        f"max diff {(my_gen - ref_gen).abs().max().item():.2e}"
+    )
 
 
 def test_lvsa_processor_engages_sparse_above_ref():
@@ -206,6 +235,55 @@ def test_cosmos_processor_print_mask(capsys):
     assert capsys.readouterr().out.strip() != ""
 
 
+def test_cosmos_processor_condition_frames_forced_global():
+    # V2V conditioning latent frames must stay global even when sparsity would
+    # otherwise window them. T_lat=100 over ref=48 -> sparse; frame 1 is not a
+    # periodic anchor with n_first=1.
+    from lvsa.cosmos3 import Cosmos3LVSAAttnProcessor
+    base = Cosmos3LVSAAttnProcessor(total_latent_frames=100, num_patches=4,
+                                    reference_latent_frames=48, window_size=4,
+                                    n_first_frames=1)
+    assert 1 not in base.metadata.global_set            # baseline drops frame 1
+    proc = Cosmos3LVSAAttnProcessor(total_latent_frames=100, num_patches=4,
+                                    reference_latent_frames=48, window_size=4,
+                                    n_first_frames=1, condition_latent_frames=[0, 1])
+    assert 0 in proc.metadata.global_set
+    assert 1 in proc.metadata.global_set                # forced global
+
+
+def test_cosmos_processor_condition_frames_survive_set_step():
+    # Rotation rebuilds metadata; condition frames must persist across steps.
+    from lvsa.cosmos3 import Cosmos3LVSAAttnProcessor
+    proc = Cosmos3LVSAAttnProcessor(total_latent_frames=100, num_patches=4,
+                                    reference_latent_frames=48, window_size=4,
+                                    n_first_frames=1, condition_latent_frames=[0, 1])
+    proc.set_step(2)
+    assert 0 in proc.metadata.global_set
+    assert 1 in proc.metadata.global_set
+
+
+def test_install_threads_condition_latent_frames():
+    from lvsa.cosmos3 import install_cosmos3_lvsa, Cosmos3LVSAAttnProcessor
+
+    class _Layer:
+        def __init__(self):
+            self.self_attn = self
+            self.processor = None
+        def set_processor(self, p):
+            self.processor = p
+
+    class _TF:
+        def __init__(self):
+            self.layers = [_Layer()]
+
+    tf = _TF()
+    # 400 frames -> 100 latent; ref 48 -> sparse; cond [0,1] forced global.
+    proc = install_cosmos3_lvsa(tf, num_frames=397, height=720, width=1280,
+                                n_first_frames=1, condition_latent_frames=[0, 1])
+    assert isinstance(proc, Cosmos3LVSAAttnProcessor)
+    assert 1 in proc.metadata.global_set
+
+
 def test_cosmos_processor_set_step_rotates():
     from lvsa.cosmos3 import Cosmos3LVSAAttnProcessor
     from lvsa.sparse_attention import LVSAMetadata
@@ -293,6 +371,8 @@ def test_cosmos_processor_explicit_kfi():
 
 
 def test_cosmos_new_flags_present():
+    # cosmos_generate imports Cosmos3OmniPipeline (diffusers >=0.39.0) at module
+    # scope; skip on older pins (e.g. vllm-omni's diffusers==0.38.0) rather than error.
     pytest.importorskip("diffusers.models.transformers.transformer_cosmos3")
     from examples import cosmos_generate
     flags = {a.option_strings[0] for a in cosmos_generate.build_parser()._actions if a.option_strings}
@@ -316,6 +396,7 @@ def test_cosmos_processor_expand_window_param():
 
 
 def test_cosmos_no_expand_window_flag():
+    # See note above: skip on diffusers pins older than 0.39.0.
     pytest.importorskip("diffusers.models.transformers.transformer_cosmos3")
     from examples import cosmos_generate
     flags = {a.option_strings[0] for a in cosmos_generate.build_parser()._actions if a.option_strings}

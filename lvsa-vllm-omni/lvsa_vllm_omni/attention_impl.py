@@ -274,6 +274,7 @@ class LVSAAttentionImpl:
     _total_instances: int = 0
     _logged_geometry: bool = False
     _logged_geometry_ambiguous: set = set()  # once-guard per candidate set
+    _logged_joint_strategy_warn: bool = False  # once-guard for unsupported joint_strategy
 
     def __init__(
         self,
@@ -285,12 +286,17 @@ class LVSAAttentionImpl:
         prefix: str = "",
         qkv_layout: Optional[str] = None,
         backend_kwargs: Optional[dict] = None,
+        cosmos_gen: bool = False,
         **extra_impl_args: Any,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
         self.softmax_scale = softmax_scale
         self.num_kv_heads = num_kv_heads or num_heads
+        # Marked True only on Cosmos gen seams (by the seam-swap installer). Gates
+        # the single-GPU _forward_local concat split below, which is unsafe to infer
+        # by shape alone on a general cross-attention impl.
+        self.cosmos_gen = cosmos_gen
         # vllm-omni 0.22 passes these two to every AttentionImpl (by keyword,
         # from diffusion/attention/layer.py). ``backend_kwargs`` carries the
         # per-role ``AttentionSpec.extra`` dict, available for future per-role
@@ -334,6 +340,39 @@ class LVSAAttentionImpl:
         value: torch.Tensor,
         attn_metadata: Any = None,
     ) -> torch.Tensor:
+        # Cosmos 3.0 gen stream. The understanding (und) tokens end up PREPENDED into
+        # `key` whenever `key` is longer than `query` — in BOTH paths:
+        #   * single-GPU (_forward_local): und concatenated into key (joint_key is None)
+        #   * Ulysses (_forward_sp): joint_strategy="front" → the framework prepends the
+        #     und into key before the backend runs, AND leaves joint_key in metadata.
+        # So key[:, :s_und] is the und and key[:, s_und:] is the frame-aligned gen grid.
+        # Split it out ONCE; do NOT also add joint_key — the und is already in `key`, and
+        # re-adding it misaligns the frame grid by s_und AND double-counts the und (this
+        # was the Ulysses motion-damping bug). Wan/HunyuanVideo are cosmos_gen=False with
+        # no joint_key, so a genuine cross-attention falls through to the dense guard.
+        joint_key = getattr(attn_metadata, "joint_key", None)
+        # The und-split below assumes the und is PREPENDED ("front"). A "rear"
+        # strategy would append it, so key[:, :s_und] would mis-slice gen as und.
+        # We only support "front"; anything else falls back to dense (correct, dense).
+        joint_strategy = getattr(attn_metadata, "joint_strategy", "front")
+        if joint_strategy != "front" and (self.cosmos_gen or joint_key is not None):
+            if not LVSAAttentionImpl._logged_joint_strategy_warn:
+                LVSAAttentionImpl._logged_joint_strategy_warn = True
+                print(f"[LVSA] Warning: unsupported joint_strategy={joint_strategy!r} on the "
+                      f"Cosmos gen seam; falling back to dense (LVSA supports 'front' only).",
+                      flush=True)
+            return self._dense_attention(query, key, value)
+        if (self.cosmos_gen or joint_key is not None) and key.shape[1] > query.shape[1]:
+            s_und = key.shape[1] - query.shape[1]
+            return self._lvsa_cosmos_dual_stream(
+                query, key[:, s_und:], value[:, s_und:], key[:, :s_und], value[:, :s_und],
+            )
+        # Pure-joint form: und ONLY in joint_key, key already gen-length (no prepend).
+        if joint_key is not None:
+            return self._lvsa_cosmos_dual_stream(
+                query, key, value, joint_key, attn_metadata.joint_value,
+            )
+
         # Cross-attention: different seq lengths → dense (benign, no warning)
         if query.shape[1] != key.shape[1]:
             return self._dense_attention(query, key, value)
@@ -382,13 +421,49 @@ class LVSAAttentionImpl:
 
     # ── LVSA path ─────────────────────────────────────────────────────────
 
-    # Run the LVSA path eager. The metadata/CSR build is data-dependent Python
-    # (``.item()``, list construction) and is rebuilt every denoising step under
-    # rotating keyframes, so under vllm-omni's mandatory ``torch.compile`` it
-    # graph-breaks and recompiles each step (the first step exceeded the
-    # server's request timeout → 504). Marking the LVSA path compiler-disabled
-    # keeps the rest of the transformer compiled while the already-fused
-    # FlashInfer / SDPA attention runs eagerly — as it does in the standalone.
+    # The metadata/CSR build is data-dependent Python (``.item()``, list
+    # construction) and is rebuilt every denoising step under rotating
+    # keyframes, so under vllm-omni's mandatory ``torch.compile`` it graph-breaks
+    # and recompiles each call. Marking it compiler-disabled keeps the rest of
+    # the transformer compiled while this stays eager — as it does in the
+    # standalone.
+    @torch.compiler.disable
+    def _build_lvsa_metadata(self, total_latent_frames: int, P: int, step_idx: int):
+        """Build (with auto-kfi + rotation offset) exactly as the inline block did."""
+        cfg = self.config
+        W = cfg.latent_window_size
+        n_first = cfg.latent_n_first_frames
+        kfi = cfg.latent_key_frame_interval
+
+        if cfg.auto_keyframes:
+            kfi = compute_auto_kfi(
+                total_latent_frames, W, n_first,
+                reference_frames=cfg.reference_latent_frames,
+                sparsity_scale=cfg.sparsity_scale,
+            )
+
+        offset = 0
+        if cfg.rotate_keyframes and kfi > 0:
+            offset = step_idx % kfi
+
+        return LVSAMetadata.build(
+            total_latent_frames=total_latent_frames,
+            num_patches=P,
+            window_size=W,
+            n_first_frames=n_first,
+            key_frame_interval=kfi,
+            rank=0,
+            world=1,
+            expand_window=cfg.expand_window,
+            keyframe_offset=offset,
+            reference_frames=cfg.reference_latent_frames,
+            sparsity_scale=cfg.sparsity_scale,
+            condition_frames=cfg.condition_latent_frames,
+        )
+
+    # Run the LVSA path eager for the same reason as ``_build_lvsa_metadata``
+    # above (the first step exceeded the server's request timeout → 504 when
+    # compiled).
     @torch.compiler.disable
     def _lvsa_attention(
         self,
@@ -425,35 +500,7 @@ class LVSAAttentionImpl:
         )
 
         if needs_rebuild:
-            cfg = self.config
-            W = cfg.latent_window_size
-            n_first = cfg.latent_n_first_frames
-            kfi = cfg.latent_key_frame_interval
-
-            if cfg.auto_keyframes:
-                kfi = compute_auto_kfi(
-                    total_latent_frames, W, n_first,
-                    reference_frames=cfg.reference_latent_frames,
-                    sparsity_scale=cfg.sparsity_scale,
-                )
-
-            offset = 0
-            if cfg.rotate_keyframes and kfi > 0:
-                offset = step_idx % kfi
-
-            self._lvsa_metadata = LVSAMetadata.build(
-                total_latent_frames=total_latent_frames,
-                num_patches=P,
-                window_size=W,
-                n_first_frames=n_first,
-                key_frame_interval=kfi,
-                rank=0,
-                world=1,
-                expand_window=cfg.expand_window,
-                keyframe_offset=offset,
-                reference_frames=cfg.reference_latent_frames,
-                sparsity_scale=cfg.sparsity_scale,
-            )
+            self._lvsa_metadata = self._build_lvsa_metadata(total_latent_frames, P, step_idx)
             self._lvsa_metadata.ensure_device(query.device)
             self._cached_total_frames = total_latent_frames
             self._cached_num_patches = P
@@ -520,6 +567,99 @@ class LVSAAttentionImpl:
             return torch.cat([out_video, out_text], dim=1)
 
         return out_video
+
+    # Run eager for the same reasons as ``_build_lvsa_metadata``/``_lvsa_attention``
+    # above (data-dependent metadata build + first-call latency under compile).
+    @torch.compiler.disable
+    def _lvsa_cosmos_dual_stream(self, query, key, value, k_und, v_und):
+        """LVSA over the Cosmos gen grid with the und stream as always-global.
+
+        query/key/value = gen [B, S_gen, H/Hkv, D]; k_und/v_und = always-global
+        understanding K/V (from attn_metadata.joint_*). S_gen = T_lat*P (+ action
+        tail). Mirrors the cosmos hook, but here in the backend so it engages
+        under Ulysses (the framework gathers the full gen grid before this runs).
+        """
+        from ._fallback import warn_fallback
+        from .cosmos_dual_stream import _cosmos_split_attention, _dense_sdpa_gqa
+
+        def _dense(q, k, v):  # gen dense full-attn over cat([und, gen])
+            return _dense_sdpa_gqa(
+                q, torch.cat([k_und, k], dim=1), torch.cat([v_und, v], dim=1),
+            )
+
+        total_frames = self._resolve_total_frames()
+        if total_frames is None:
+            warn_fallback(origin="forward_cuda", reason="no_t_lat",
+                          seq_len=query.shape[1], extra={"hint": "set LVSA_TOTAL_LATENT_FRAMES"})
+            return _dense(query, key, value)
+
+        S_gen = query.shape[1]
+        P, _text_tokens = self._detect_geometry(S_gen, total_frames)
+        if P is None:
+            warn_fallback(origin="forward_cuda", reason="geometry_detect",
+                          seq_len=S_gen, extra={"T_lat": total_frames, "known_ppf": _ppf_candidates()})
+            return _dense(query, key, value)
+
+        video_len = total_frames * P
+        counter = _get_step_counter()
+        counter.tick(id(self), S_gen)
+        step_idx = step_tracker.get_step()
+        # Reuse the same metadata cache as _lvsa_attention: a data-dependent Python
+        # build + H2D copy on every layer x step x CFG pass is exactly what the
+        # needs_rebuild gate exists to avoid. Safe to share the fields — an impl
+        # instance only ever runs ONE path (Cosmos gen seam here, or _lvsa_attention
+        # on Wan/HunyuanVideo), so the caches never collide. Keyed on T_lat/P/step
+        # (step only matters when rotate_keyframes shifts the grid).
+        needs_rebuild = (
+            self._lvsa_metadata is None
+            or self._cached_total_frames != total_frames
+            or self._cached_num_patches != P
+            or (self.config.rotate_keyframes and self._cached_step != step_idx)
+        )
+        if needs_rebuild:
+            self._lvsa_metadata = self._build_lvsa_metadata(total_frames, P, step_idx)
+            self._lvsa_metadata.ensure_device(query.device)
+            self._cached_total_frames = total_frames
+            self._cached_num_patches = P
+            self._cached_step = step_idx
+        metadata = self._lvsa_metadata
+
+        if os.environ.get("LVSA_PROBE") == "1":  # diagnostic only (no behavior change)
+            import torch.distributed as _d
+            _init = _d.is_available() and _d.is_initialized()
+            _r = _d.get_rank() if _init else 0
+            _w = _d.get_world_size() if _init else 1
+            from ._sp import is_sp_active as _isp
+            print(f"[LVSA-PROBE r{_r}/{_w} sp={_isp()}] q={tuple(query.shape)} "
+                  f"gen_k={tuple(key.shape)} und_k={tuple(k_und.shape)} und_v={tuple(v_und.shape)} "
+                  f"T_lat={total_frames} P={P} video_len={video_len} S_gen={S_gen} "
+                  f"s_extra={S_gen - video_len} nGlobalFrames={len(metadata.global_indices)}",
+                  flush=True)
+
+        def _sparse(q_v, k_v, v_v, k_global, v_global, md):
+            if os.environ.get("LVSA_PROBE") == "1":
+                print(f"[LVSA-PROBE kglobal] q_v={tuple(q_v.shape)} k_v={tuple(k_v.shape)} "
+                      f"k_global={tuple(k_global.shape)} v_global={tuple(v_global.shape)}", flush=True)
+            # Same dispatch as _lvsa_attention (attention_impl.py:509-531): FlashInfer
+            # runner when available, legible SDPA degrade when not, SDPA otherwise. The
+            # und + gen anchors are already merged into k_global by _cosmos_split_attention,
+            # so the plain shared runner (not the dual-stream runner) is correct here.
+            if self.config.backend == "flashinfer":
+                from .flashinfer_runner import FLASHINFER_AVAILABLE, get_shared_runner
+                if FLASHINFER_AVAILABLE:
+                    return get_shared_runner().run(q_v, k_v, v_v, k_global, v_global, md)
+                _warn_flashinfer_unavailable_once()
+                return sparse_windowed_attention(
+                    q_v, k_v, v_v, k_global, v_global, md, backend="sdpa",
+                )
+            return sparse_windowed_attention(
+                q_v, k_v, v_v, k_global, v_global, md, backend=self.config.backend,
+            )
+
+        return _cosmos_split_attention(
+            query, key, value, k_und, v_und, video_len, metadata, P,
+            sparse_fn=_sparse, dense_fn=_dense_sdpa_gqa,
+        )
 
     # ── Dense fallback ───────────────────────────────────────────────────
 

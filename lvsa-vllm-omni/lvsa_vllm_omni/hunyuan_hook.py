@@ -231,6 +231,7 @@ class HunyuanLVSAState:
                 world=1,
                 expand_window=cfg.expand_window,
                 keyframe_offset=offset,
+                condition_frames=cfg.condition_latent_frames,
                 reference_frames=cfg.reference_latent_frames,
                 sparsity_scale=cfg.sparsity_scale,
             )

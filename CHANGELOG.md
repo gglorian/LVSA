@@ -4,6 +4,49 @@ All notable changes to LVSA will be documented in this file. Format: [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+
+- **Conditioning anchors on the vllm-omni Cosmos backend path** (`lvsa-vllm-omni`).
+  `LVSAAttentionImpl._build_lvsa_metadata` now threads `condition_latent_frames`
+  into `LVSAMetadata.build(condition_frames=...)`, so I2V/V2V conditioning latent
+  frames are forced into the global anchor set on the plugin (backend) path — it
+  previously only reached the standalone processor path. New backend-path test in
+  `tests/test_cosmos3_geometry_split.py`.
+- **`joint_strategy` guard on the Cosmos gen seam** (`attention_impl.py`). LVSA
+  supports only the `"front"` und-prepend layout; any other `joint_strategy` now
+  falls back to dense with a one-time `[LVSA]` warning instead of splitting the
+  stream incorrectly.
+- **Per-forward metadata cache in `_lvsa_cosmos_dual_stream`** — the dual-stream
+  path now reuses `self._lvsa_metadata` across forwards, rebuilding only when
+  total frames / patches-per-frame / (rotating) step change, matching the
+  single-stream path.
+
+### Changed
+
+- **Cosmos backend seam swap uses per-rank (local) head counts** (`cosmos3_backend.py`).
+  `_swap_seam_to_lvsa` now stores `num_heads_local`/`num_kv_heads_local` (correct
+  under TP) rather than the global counts. `install_cosmos3_lvsa_backend`'s
+  `total_latent_frames`/`num_patches` args are documented as diagnostic-only
+  (geometry is resolved per-forward from env/sequence).
+- **`examples/cosmos_generate.py`** raises a clean `SystemExit` on a malformed
+  `--condition-latent-frames` value instead of a bare `ValueError` traceback, and
+  documents the `diffusers >=0.39.0` requirement.
+
+### Removed
+
+- **Legacy Cosmos3 forward-patch hook** — `lvsa_vllm_omni/cosmos3_hook.py` and
+  `tests/test_cosmos3_hook.py` deleted. The hook bailed to dense under any SP and
+  is fully superseded by the backend seam-swap (`LVSA_COSMOS3_BACKEND=1`, engages
+  under single-GPU and Ulysses). The hook-only env vars `LVSA_DISPATCH_BACKEND`
+  and `LVSA_REPEAT_KV` are removed with it.
+
+### Fixed
+
+- **`_swap_seam_to_lvsa` no longer reassigns `seam.attn.attn_impl_cls`** — nothing
+  reads it after `__init__`, and setting it was a footgun: a future
+  re-instantiation from the class would rebuild `LVSAAttentionImpl` without
+  `cosmos_gen=True` and silently degrade Cosmos to dense.
+
 
 ## [1.3.0] — 2026-06-16
 
@@ -183,9 +226,8 @@ torch 2.11 / CUDA 13). The previous `vllm-omni 0.18.0` line is maintained on the
 
 **Breaking changes for users:**
 
-- **Backend selection moved to per-role `AttentionConfig`.** vllm-omni 0.22
-  removed the `DIFFUSION_ATTENTION_BACKEND` env var. Select LVSA per attention
-  role instead — on the CLI:
+- **Backend selection moved to per-role `AttentionConfig`.** Select LVSA per
+  attention role — on the CLI:
   `--diffusion-attention-config '{"per_role": {"self": {"backend": "LVSA"}}}'`,
   or via the Python API:
   `Omni(..., diffusion_attention_config={"per_role": {"self": {"backend": "LVSA"}}})`.

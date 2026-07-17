@@ -18,7 +18,6 @@ DTYPE=${DTYPE:-bfloat16}
 
 case "$MODEL_FAMILY" in
   wan)
-    export LVSA_WAN_HOOK=1
     export LVSA_REFERENCE_LATENT_FRAMES=21
     ;;
   hunyuan|hunyuanvideo|hv)
@@ -30,8 +29,7 @@ case "$MODEL_FAMILY" in
     ;;
 esac
 
-# vllm-omni 0.22 dropped the DIFFUSION_ATTENTION_BACKEND env var; the
-# `lvsa_vllm_omni.serve` wrapper injects the per-role AttentionConfig
+# The `lvsa_vllm_omni.serve` wrapper injects the per-role AttentionConfig
 # (--diffusion-attention-config) automatically.
 export LVSA_AUTO_KEYFRAMES=1
 export LVSA_ROTATE_KEYFRAMES=1

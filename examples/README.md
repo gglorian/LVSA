@@ -6,7 +6,7 @@ Standalone generation scripts for each supported model + a vllm-omni serving rec
 |---|---|
 | [`wan_generate.py`](wan_generate.py) | Wan 2.1 / 2.2 single- or multi-GPU generation |
 | [`hunyuan_generate.py`](hunyuan_generate.py) | HunyuanVideo 1.5 single- or multi-GPU generation |
-| [`cosmos_generate.py`](cosmos_generate.py) | Cosmos 3.0 single-GPU generation (experimental; needs diffusers main) |
+| [`cosmos_generate.py`](cosmos_generate.py) | Cosmos 3.0 single-GPU generation (experimental; needs diffusers>=0.39) |
 | [`cogvideox_generate.py`](cogvideox_generate.py) | CogVideoX 5B (experimental — correctness only) |
 | [`vllm_omni_serve.sh`](vllm_omni_serve.sh) | Minimal vllm-omni serving wrapper |
 
@@ -98,7 +98,8 @@ python examples/cosmos_generate.py \
 ```
 
 **Requirements / notes:**
-- Needs **diffusers main** (`>=0.39.0.dev0`) for `Cosmos3OmniPipeline`. Standard-release diffusers (used by the other models) stops at Cosmos 2.5. Note `pip install lvsa[diffusers]` only floors diffusers at `>=0.31` (enough for the other models + CI); for Cosmos you must install diffusers main explicitly (`pip install "git+https://github.com/huggingface/diffusers.git"`) or `cosmos_generate.py` fails at import.
+- Needs **diffusers `>=0.39.0`** for `Cosmos3OmniPipeline` — released 2026-07-03, so a normal release install is now enough (it was main-only before that; the old `pip install "git+https://github.com/huggingface/diffusers.git"` workaround is no longer needed). `pip install lvsa[diffusers]` floors diffusers at `>=0.31`, which resolves to a `>=0.39` release today.
+- **Caveat:** `vllm-omni` hard-pins `diffusers==0.38.0`, which predates `Cosmos3OmniPipeline`. So in an env with vllm-omni installed, `cosmos_generate.py` still fails at import — use a separate env for the standalone path, or use the vllm-omni plugin path instead (which has its own Cosmos support).
 - Cosmos is **separate-stream**: the diffusers `Cosmos3AttnProcessor` runs the text/VLM `und` tokens as causal self-attention and the video `gen` tokens as full attention over `cat([k_und, k_gen])`. LVSA wraps **only the gen pathway** (window gen↔gen + keyframes, all `und` kept global) and leaves the `und` causal path byte-identical. It engages via a **processor swap** (`lvsa/cosmos3.py::install_cosmos3_lvsa`), not the adapter ABC.
 - MVP scope: **single-GPU** (no `torchrun`), **SDPA** backend, fixed keyframes (no `--rotate-keyframes`). FlashInfer and Ulysses CP are follow-ups.
 - `reference_latent_frames=48` (189-frame native horizon) is the default; override with `--sparsity-scale < 1` for more sparsity below the cap.
@@ -135,7 +136,7 @@ examples/vllm_omni_serve.sh hunyuan /path/to/HunyuanVideo-1.5-Diffusers-480p_t2v
 PORT=8200 DTYPE=float16 examples/vllm_omni_serve.sh wan /path/to/Wan
 ```
 
-The wrapper sets the required `LVSA_*` env vars (correct `LVSA_REFERENCE_LATENT_FRAMES` per model, `LVSA_WAN_HOOK=1` for Wan, etc.) and runs `python -m lvsa_vllm_omni.serve`. See [`../docs/VLLM_OMNI_INTEGRATION.md`](../docs/VLLM_OMNI_INTEGRATION.md) for the full configuration reference.
+The script sets the `LVSA_*` env vars (correct `LVSA_REFERENCE_LATENT_FRAMES` per model, etc.) and runs `python -m lvsa_vllm_omni.serve`, which injects the per-role `AttentionConfig` so the LVSA **backend** drives sparse attention — no `LVSA_*_HOOK` needed for Wan/HunyuanVideo. See [`../docs/VLLM_OMNI_INTEGRATION.md`](../docs/VLLM_OMNI_INTEGRATION.md) for the full configuration reference.
 
 ---
 

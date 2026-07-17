@@ -5,7 +5,9 @@ Example:
       --prompt "A dog running in the forest." --num-frames 189 \
       --height 720 --width 1280 --steps 35 --lvsa --output-name cosmos_1x
 
-Requires diffusers main (>=0.39.0.dev0) for Cosmos3OmniPipeline.
+Requires diffusers >=0.39.0 for Cosmos3OmniPipeline (released 2026-07-03; previously
+main-only). NOTE: vllm-omni hard-pins diffusers==0.38.0, so this standalone path does
+not run in an env that has vllm-omni installed.
 
 Note on output attribute: Cosmos3OmniPipelineOutput uses `.video` (not `.frames`).
 The pipeline's video_processor.postprocess_video already indexes batch dim 0, so
@@ -69,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
                     default=COSMOS3_REFERENCE_LATENT_FRAMES,
                     help="Model training horizon in latent frames (default: "
                          f"{COSMOS3_REFERENCE_LATENT_FRAMES} for Cosmos3-Nano 189f).")
+    ap.add_argument("--condition-latent-frames", type=str, default="",
+                    help="Comma-separated V2V/I2V conditioning LATENT-frame "
+                         "indices (e.g. '0,1' for Cosmos3 condition_frame_indexes_"
+                         "vision) to force into the global set every step, "
+                         "independent of --n-first-frames. Empty = T2V (no-op).")
     ap.add_argument("--rotate-keyframes", action="store_true",
                     help="Shift periodic keyframes by 1 each denoising step, "
                          "cycling through all positions over key_frame_interval steps.")
@@ -106,6 +113,13 @@ def main():
     if args.lvsa:
         # --auto-keyframes overrides --key-frame-interval (None = auto in the engine)
         kfi = None if args.auto_keyframes else args.key_frame_interval
+        try:
+            cond_frames = [int(x) for x in args.condition_latent_frames.split(",") if x.strip()]
+        except ValueError:
+            raise SystemExit(
+                f"--condition-latent-frames: expected a comma-separated list of integer latent-frame "
+                f"indices (e.g. '0,1'), got {args.condition_latent_frames!r}."
+            )
         lvsa_processor = install_cosmos3_lvsa(
             pipe.transformer,
             num_frames=args.num_frames,
@@ -118,6 +132,7 @@ def main():
             key_frame_interval=kfi,
             expand_window=args.expand_window,
             use_flashinfer=args.flashinfer,
+            condition_latent_frames=cond_frames,
         )
         if args.show_mask:
             lvsa_processor.print_attention_mask_compact()

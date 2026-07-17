@@ -177,6 +177,12 @@
       "nargs": 0,
       "type": null
     },
+    "--condition-latent-frames": {
+      "choices": null,
+      "default": "",
+      "nargs": null,
+      "type": "str"
+    },
     "--flashinfer": {
       "choices": null,
       "default": false,

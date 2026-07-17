@@ -29,9 +29,9 @@ Then look for `[LVSA-FALLBACK]` warnings during the *generation* steps (not warm
 [LVSA-FALLBACK] origin=forward_cuda reason=no_t_lat seq_len=…
 ```
 
-If you see no `[LVSA]` lines at all, the backend wasn't selected — for vllm-omni 0.22 check that `--diffusion-attention-config '{"per_role": {"self": {"backend": "LVSA"}}}'` is passed (the `python -m lvsa_vllm_omni.serve` wrapper injects it; the `DIFFUSION_ATTENTION_BACKEND` env var was removed in 0.22).
+If you see no `[LVSA]` lines at all, the backend wasn't selected — for vllm-omni 0.22 check that `--diffusion-attention-config '{"per_role": {"self": {"backend": "LVSA"}}}'` is passed (the `python -m lvsa_vllm_omni.serve` wrapper injects it).
 
-If you see backend selection but no per-block engagement on Wan, check `LVSA_WAN_HOOK=1` (required for Wan; without it Wan's `_sp_plan` pre-shards the sequence and geometry detection fails silently).
+If you see backend selection but no per-block engagement on Wan, it's almost always the **warm-up** pass (a tiny dummy forward that doesn't match the video geometry) — look for `[LVSA] Geometry detected: … video_seq=N` on the first real generation, and ignore the single `[LVSA-FALLBACK] … seq_len=1024` warm-up line before it. If the *real* forward also falls back, it's a genuine geometry mismatch: check `LVSA_TOTAL_LATENT_FRAMES` (≈ frames/4) and, for non-480p, `LVSA_PATCHES_PER_FRAME`. Under Ulysses the backend engages on the framework-gathered full grid; under Ring it's dense by design. (`LVSA_WAN_HOOK=1` does **not** help here — under sequence-parallel the hook just delegates back to the same backend.)
 
 ### Fix
 

@@ -25,11 +25,15 @@ uv pip install -e .
 # conflicts with the standalone engine's torch — install it in a SEPARATE venv
 # (.venv-vllm). See the two-venv note in lvsa-vllm-omni/examples/README.md.
 uv pip install -e lvsa-vllm-omni/
-# vllm-omni 0.22.0 is a stable release — install it from the git tag to match
-# vllm 0.22.0.
-uv pip install "vllm==0.22.0"
+# vllm-omni 0.24.0rc1 is a release candidate — install it from the git tag to match
+# vllm 0.24.0.
+uv pip install "vllm==0.24.0"
+# --no-build-isolation reuses the current env to build vllm-omni; it needs the
+# build/runtime deps present, so install them first (else the build fails on
+# setuptools_scm and register hits a missing aenum):
+uv pip install setuptools_scm aenum
 uv pip install --no-build-isolation \
-  "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.22.0"
+  "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.24.0rc1"
 
 # Video-quality assessment (only needed for benchmarks/eval)
 uv pip install -e vqeval/
@@ -63,7 +67,7 @@ docker pull lvsa-vllm-omni:latest
 ```
 
 The image contains:
-- vLLM 0.22.0 + vLLM-Omni 0.22.0 (built from git)
+- vLLM 0.24.0 + vLLM-Omni 0.24.0rc1 (built from git)
 - LVSA installed editably at `/workdir/code` (mount your repo to override)
 - diffusers 0.38 with HunyuanVideo and Wan pipelines
 - FlashInfer kernels precompiled

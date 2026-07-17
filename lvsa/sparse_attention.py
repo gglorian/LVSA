@@ -460,10 +460,20 @@ class LVSAMetadata:
         expand_window: bool = True,
         keyframe_offset: int = 0,
         boundary_guards: Optional[List[int]] = None,
+        condition_frames: Optional[List[int]] = None,
         reference_frames: int = 21,
         sparsity_scale: float = 1.0,
     ) -> "LVSAMetadata":
-        """Factory: compute all derived index structures from config params."""
+        """Factory: compute all derived index structures from config params.
+
+        ``condition_frames`` are V2V/I2V conditioning latent-frame indices that
+        MUST be globally attended regardless of ``n_first_frames``/``kfi``. In
+        Cosmos 3 V2V the reference is re-injected into these frames every
+        denoise step (clean, stable anchors); if the sparse pattern fails to
+        keep them global the generation loses its reference and drifts. Unioned
+        into the global set exactly like ``boundary_guards``; out-of-range
+        indices (``< 0`` or ``>= total_latent_frames``) are dropped.
+        """
         T = total_latent_frames
         P = num_patches
 
@@ -484,7 +494,14 @@ class LVSAMetadata:
         user_globals = compute_global_indices(T, n_first_frames, kfi, keyframe_offset)
         if boundary_guards is None:
             boundary_guards = []
-        global_indices_list = sorted(set(user_globals) | set(boundary_guards))
+        if condition_frames is None:
+            condition_frames = []
+        # Conditioning frames are always-global anchors; clamp to the valid
+        # frame grid so a stale/over-specified index can never index OOB.
+        cond_valid = [c for c in condition_frames if 0 <= c < T]
+        global_indices_list = sorted(
+            set(user_globals) | set(boundary_guards) | set(cond_valid)
+        )
         global_set = set(global_indices_list)
 
         # ── Per-frame token ranges ──

@@ -8,7 +8,7 @@
       "name": "lvsa-quickstart",
       "source": "./skills/lvsa-quickstart",
       "description": "Install LVSA and generate your first long video. Picks SDPA vs FlashInfer, sets the right LVSA_REFERENCE_LATENT_FRAMES per model (Wan/HunyuanVideo/Cosmos 3.0/CogVideoX), verifies the sparse path engaged.",
-      "version": "1.4.0"
+      "version": "1.4.1"
     },
     {
       "name": "lvsa-tuning",
@@ -20,7 +20,7 @@
       "name": "lvsa-troubleshooting",
       "source": "./skills/lvsa-troubleshooting",
       "description": "Diagnose LVSA failure modes: silent dense fallback, OOM at long sequences, missing output mp4 in Docker, quality regression at training reference.",
-      "version": "1.1.0"
+      "version": "1.1.1"
     },
     {
       "name": "lvsa-add-model",
@@ -31,8 +31,8 @@
     {
       "name": "lvsa-vllm-omni",
       "source": "./skills/lvsa-vllm-omni",
-      "description": "Configure and run the LVSA vllm-omni plugin: env vars, geometry overrides, hooks for Wan vs HunyuanVideo, Cosmos 3.0 (offline + cross-attention hook; points to the standalone path too), multi-GPU (tensor-parallel engages LVSA for big models; Ulysses/Ring SP falls back to dense).",
-      "version": "1.6.0"
+      "description": "Configure and run the LVSA vllm-omni plugin: env vars, geometry overrides, hooks for Wan vs HunyuanVideo, Cosmos 3.0 backend seam-swap (LVSA_COSMOS3_BACKEND — engages sparse single-GPU and under Ulysses SP), multi-GPU (tensor-parallel and Ulysses engage LVSA; Ring SP falls back to dense).",
+      "version": "1.7.1"
     },
     {
       "name": "lvsa-reproduce-paper",

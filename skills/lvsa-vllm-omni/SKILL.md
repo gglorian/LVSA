@@ -39,14 +39,12 @@ vllm serve --omni --model HunyuanVideo-1.5-Diffusers-480p_t2v \
   --diffusion-attention-config '{"per_role": {"self": {"backend": "LVSA"}}}'
 ```
 
-vllm-omni 0.22 selects the backend per role via `--diffusion-attention-config`
-(the `DIFFUSION_ATTENTION_BACKEND` env var was removed). `python -m
-lvsa_vllm_omni.serve` injects that flag for you.
+vllm-omni 0.22 selects the backend per role via `--diffusion-attention-config`.
+`python -m lvsa_vllm_omni.serve` injects that flag for you.
 
 ### Wan 2.x
 
 ```bash
-LVSA_WAN_HOOK=1 \
 LVSA_AUTO_KEYFRAMES=1 \
 LVSA_REFERENCE_LATENT_FRAMES=21 \
 LVSA_ROTATE_KEYFRAMES=1 \
@@ -54,19 +52,25 @@ vllm serve --omni --model Wan2.2-T2V-14B \
   --diffusion-attention-config '{"per_role": {"self": {"backend": "LVSA"}}}'
 ```
 
-Wan requires `LVSA_WAN_HOOK=1` explicitly. Without it, Wan's `_sp_plan` pre-shards the sequence and geometry detection fails silently.
+Wan runs through the LVSA **backend** by default (no hook needed) — it engages under single-GPU, TP, and Ulysses. `LVSA_WAN_HOOK=1` is **optional/legacy**: the monkey-patch path, which engages under TP but falls back to dense under any SP. Prefer the backend.
 
-### Cosmos 3.0 (experimental — plugin offline + hook)
+### Cosmos 3.0 (experimental — plugin offline)
 
-In the **plugin**, Cosmos engages LVSA through a **cross-attention
-hook** (`LVSA_COSMOS3_HOOK=1`, patches `Cosmos3CrossAttention.forward`), not the
-attention backend. cosmos3 is included in **v0.22.0 stable**, so the same
+In the **plugin**, Cosmos engages LVSA through the same kind of **attention-backend
+seam-swap** as Wan/HunyuanVideo: `LVSA_COSMOS3_BACKEND=1` replaces
+`Cosmos3CrossAttention`'s resolved attention backend (`self.attn`) with
+`LVSAAttentionImpl` at construction (`cosmos3_backend.py`). This engages sparse
+**single-GPU and under Ulysses SP** (GPU-verified 2026-07-07) — the earlier
+forward-patch hook (`LVSA_COSMOS3_HOOK`, which bailed under SP) has been removed.
+cosmos3 is included in **v0.22.0 stable**, so the same
 `@v0.22.0` install covers it (no `main` build needed). Run it through the offline runner:
 
 > **Standalone (non-serving) path also exists now.** `examples/cosmos_generate.py`
 > + `lvsa/cosmos3.py::install_cosmos3_lvsa` run Cosmos LVSA directly on the
 > diffusers `Cosmos3OmniPipeline` (single-GPU, SDPA), via a **processor swap**
-> rather than this plugin hook. It needs **diffusers main** (`>=0.39.0.dev0`). See
+> rather than this plugin hook. It needs **diffusers `>=0.39.0`** — note vllm-omni
+> hard-pins `diffusers==0.38.0`, so the standalone path does NOT run in a vllm-omni
+> env; use a separate env for it. See
 > the repo `examples/README.md`. The plugin path below is for vllm-omni serving.
 
 ```bash
@@ -77,7 +81,7 @@ attention backend. cosmos3 is included in **v0.22.0 stable**, so the same
     --output-name cosmos_1x
 ```
 
-`--family cosmos` sets `LVSA_COSMOS3_HOOK=1`, `LVSA_REFERENCE_LATENT_FRAMES=48`,
+`--family cosmos` sets `LVSA_COSMOS3_BACKEND=1`, `LVSA_REFERENCE_LATENT_FRAMES=48`,
 and `model_config={"guardrails": False}` for you. Cosmos specifics: **720p
 native**, single-GPU (TP=1), **~400-frame single-shot cap** (T_lat=100 ≈ 2.08×
 ref), guardrails **must** be off, and **SDPA-LVSA does not beat dense up to the
@@ -106,7 +110,7 @@ PORT=8200 DTYPE=float16 examples/vllm_omni_serve.sh wan ...
 | `--diffusion-attention-config` (CLI flag, not env) | (platform default) | `'{"per_role": {"self": {"backend": "LVSA"}}}'` to engage. The serve wrapper injects it. |
 | `LVSA_REFERENCE_LATENT_FRAMES` | `21` | Per-model training horizon. **CRITICAL.** Wan2.1=21, Wan2.2-5B=31, HV=33, Cosmos=48, Cog=13. |
 | `LVSA_AUTO_KEYFRAMES` | `1` | Auto-derive keyframe interval from frame count |
-| `LVSA_WAN_HOOK` | `0` | **Required for Wan**. Off for HunyuanVideo. |
+| `LVSA_WAN_HOOK` | `0` | **Optional / legacy — not required.** Wan runs through the LVSA backend by default (engages under single-GPU, TP, and Ulysses). |
 | `LVSA_ROTATE_KEYFRAMES` | `0` | Shift keyframe grid each denoising step (recommended at extension) |
 
 ### Tuning
@@ -155,7 +159,7 @@ If you see `[LVSA-FALLBACK] origin=forward_cuda reason=geometry_detect ...`, the
 
 1. Is `seq_len = T_lat * P + enc_tokens` for any P in `candidate_patches_per_frame()`?
 2. Is `LVSA_PATCHES_PER_FRAME` set if you're at a non-default resolution?
-3. For Wan: is `LVSA_WAN_HOOK=1`?
+3. For Wan: backend engaged? (no hook needed; `LVSA_WAN_HOOK=1` is optional/legacy)
 
 ## Multi-GPU
 
@@ -192,7 +196,8 @@ lvsa-vllm-omni/
 │   ├── attention_impl.py        # LVSAAttentionImpl → sparse_windowed_attention()
 │   ├── wan_hook.py              # Wan-specific monkey patch
 │   ├── hunyuan_hook.py          # HunyuanVideo-specific monkey patch
-│   ├── register.py              # Hook auto-install based on env vars
+│   ├── cosmos3_backend.py       # Cosmos 3.0 attention-backend seam-swap
+│   ├── register.py              # Hook/backend auto-install based on env vars
 │   ├── config.py                # LVSAConfig dataclass (env var parsing)
 │   ├── global_kv.py             # Global K/V gather helpers
 │   ├── step_tracker.py          # Per-step state
@@ -204,7 +209,7 @@ lvsa-vllm-omni/
 
 | Symptom | Fix |
 |---|---|
-| No `[LVSA]` log lines | Check `--diffusion-attention-config '{"per_role": {"self": {"backend": "LVSA"}}}'` is passed (or use the serve wrapper); for Wan also `LVSA_WAN_HOOK=1` |
+| No `[LVSA]` log lines | Check `--diffusion-attention-config '{"per_role": {"self": {"backend": "LVSA"}}}'` is passed (or use the serve wrapper); the Wan backend needs no extra flag (`LVSA_WAN_HOOK=1` is optional/legacy) |
 | `[LVSA-FALLBACK] reason=geometry_detect` | Set `LVSA_PATCHES_PER_FRAME` (or HEIGHT/WIDTH) for your resolution |
 | Quality regression at 1× | `LVSA_REFERENCE_LATENT_FRAMES` wrong for the model |
 | No speedup despite engagement | At T_lat ≤ ref, kfi=1 → fully dense. Lower `LVSA_SPARSITY_SCALE` to see real sparsity |

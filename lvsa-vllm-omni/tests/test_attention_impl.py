@@ -222,3 +222,15 @@ class TestStepCounterCFGParallel:
         c = ai._StepCounter()
         steps = [c.tick(layer_id=i % 3, seq_len=100) for i in range(7)]
         assert steps[5] == 0 and steps[6] == 1
+
+
+def test_build_lvsa_metadata_reusable(monkeypatch):
+    for key in list(__import__("os").environ):
+        if key.startswith("LVSA_"):
+            monkeypatch.delenv(key, raising=False)
+    from lvsa_vllm_omni.attention_impl import LVSAAttentionImpl
+    from lvsa.sparse_attention import LVSAMetadata
+    impl = LVSAAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.125)
+    md = impl._build_lvsa_metadata(total_latent_frames=8, P=4, step_idx=0)
+    assert isinstance(md, LVSAMetadata)
+    assert 0 < len(md.global_indices) <= 8

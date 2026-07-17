@@ -17,6 +17,23 @@ class TestConfigDefaults:
         assert c.vae_temporal_factor == 4
         assert c.total_latent_frames is None
         assert c.sparsity_scale == 1.0
+        assert c.condition_latent_frames == []
+
+    def test_condition_latent_frames_from_env(self, monkeypatch):
+        monkeypatch.setenv("LVSA_CONDITION_LATENT_FRAMES", "0,1")
+        c = LVSAConfig.from_env()
+        assert c.condition_latent_frames == [0, 1]
+
+    def test_condition_latent_frames_empty_default(self, monkeypatch):
+        for key in list(os.environ):
+            if key.startswith("LVSA_"):
+                monkeypatch.delenv(key, raising=False)
+        assert LVSAConfig.from_env().condition_latent_frames == []
+
+    def test_condition_latent_frames_malformed_ignored(self, monkeypatch):
+        monkeypatch.setenv("LVSA_CONDITION_LATENT_FRAMES", "0, x, 2")
+        # Non-integer tokens are skipped rather than crashing the worker.
+        assert LVSAConfig.from_env().condition_latent_frames == [0, 2]
 
     def test_latent_properties(self):
         c = LVSAConfig(window_size=12, n_first_frames=4, key_frame_interval=16,

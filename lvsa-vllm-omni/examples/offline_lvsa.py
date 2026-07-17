@@ -4,8 +4,10 @@ No HTTP server (so no /v1/videos/sync 600s timeout). Exercises the SAME LVSA
 code as the served path:
   * wan / hunyuan -> LVSA attention BACKEND (attention_impl.py + flashinfer_runner.py,
     the LSE-merge), selected via diffusion_attention_config {self: LVSA} + LVSA_BACKEND.
-  * cosmos        -> LVSA cross-attention HOOK (cosmos3_hook.py), which routes to the
-    FlashInfer runner when LVSA_BACKEND=flashinfer.
+  * cosmos        -> LVSA attention-backend seam-swap (cosmos3_backend.py) on
+    Cosmos3CrossAttention.attn.attention, which routes to the FlashInfer
+    runner when LVSA_BACKEND=flashinfer. Engages sparse single-GPU AND
+    under Ulysses SP.
 
 Usage:
   offline_lvsa.py --family hunyuan --model /data/HunyuanVideo-1.5-Diffusers-480p_t2v \
@@ -65,12 +67,20 @@ def parse_args():
                     help="tensor_parallel_size: TP shards weights+heads, full sequence "
                          "per rank (the axis that fits big models like Wan2.2 14B/A14B).")
     ap.add_argument("--ulysses", type=int, default=1,
-                    help="ulysses_degree: sequence-parallel shards the frame grid → "
-                         "LVSA hooks fall back to dense (reason=sequence_parallel).")
+                    help="ulysses_degree: sequence-parallel shards the frame grid. "
+                         "The cosmos backend engages LVSA sparse under Ulysses; the "
+                         "wan/hunyuan hooks fall back to dense there (reason=sequence_parallel).")
     ap.add_argument("--omni-kw", action="append", default=[], metavar="KEY=VAL",
                     help="Extra Omni() kwargs (repeatable, int/bool-cast), e.g. "
                          "--omni-kw cfg_parallel_size=2 --omni-kw pipeline_parallel_size=2 "
                          "--omni-kw use_hsdp=true --omni-kw hsdp_shard_size=2.")
+    ap.add_argument("--cache-backend", default=None,
+                    choices=["cache_dit", "teacache", "magcache", "step_cache"],
+                    help="Enable a diffusion step-cache backend (e.g. cache_dit).")
+    ap.add_argument("--cache-cfg", action="append", default=[], metavar="KEY=VAL",
+                    help="DiffusionCacheConfig fields (repeatable, float/int/bool-cast), e.g. "
+                         "--cache-cfg residual_diff_threshold=0.12 --cache-cfg enable_taylorseer=true "
+                         "--cache-cfg taylorseer_order=1 --cache-cfg max_warmup_steps=8.")
     return ap.parse_args()
 
 
@@ -129,7 +139,7 @@ def main():
         if a.patches_per_frame is not None:
             os.environ["LVSA_PATCHES_PER_FRAME"] = str(a.patches_per_frame)
         if a.family == "cosmos":
-            os.environ["LVSA_COSMOS3_HOOK"] = "1"     # hook does LVSA on cross-attn
+            os.environ["LVSA_COSMOS3_BACKEND"] = "1"   # seam-swap: sparse single-GPU + Ulysses
         # wan/hunyuan: no hook -> the LVSA backend handles it (flashinfer LSE-merge)
 
     from lvsa_vllm_omni.register import register_lvsa_backend
@@ -164,6 +174,24 @@ def main():
         elif v.lstrip("-").isdigit():
             v = int(v)
         omni_kwargs[k] = v
+    if a.cache_backend:
+        omni_kwargs["cache_backend"] = a.cache_backend
+        cache_cfg = {}
+        for kv in a.cache_cfg:
+            k, _, v = kv.partition("=")
+            if v.lower() in ("true", "false"):
+                v = v.lower() == "true"
+            elif v.lstrip("-").isdigit():
+                v = int(v)
+            else:
+                try:
+                    v = float(v)
+                except ValueError:
+                    pass
+            cache_cfg[k] = v
+        if cache_cfg:
+            omni_kwargs["cache_config"] = cache_cfg
+        print(f"[offline_lvsa] cache_backend={a.cache_backend} cache_config={cache_cfg}", flush=True)
     omni = Omni(model=a.model, tensor_parallel_size=a.tp, dtype="bfloat16", **omni_kwargs)
     try:
         pk = dict(

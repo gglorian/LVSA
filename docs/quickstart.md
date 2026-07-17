@@ -53,7 +53,7 @@ torchrun --nproc_per_node=2 examples/wan_generate.py \
 
 ### Cosmos 3.0 (experimental, standalone)
 
-Cosmos 3.0 uses a separate code path (a processor swap, not the adapter ABC) and needs **diffusers main** (`>=0.39.0.dev0`):
+Cosmos 3.0 uses a separate code path (a processor swap, not the adapter ABC) and needs **diffusers `>=0.39.0`** (released 2026-07-03; main-only before that). Note vllm-omni hard-pins `diffusers==0.38.0`, so this standalone path does not run in an env that has vllm-omni installed:
 
 ```bash
 python examples/cosmos_generate.py \
@@ -88,7 +88,6 @@ attention **backend** via the per-role `diffusion_attention_config`
 uses the same backend path; only Cosmos uses a hook). Under the hood the key
 settings are:
 - per-role AttentionConfig selecting `LVSA` for the self-attention role
-  (vllm-omni 0.22 replaced the `DIFFUSION_ATTENTION_BACKEND` env var)
 - `LVSA_AUTO_KEYFRAMES=1` — auto-derive the keyframe interval
 - `LVSA_REFERENCE_LATENT_FRAMES=33` — model's training horizon in latent frames (33 for HunyuanVideo, 21 for Wan, 13 for CogVideoX)
 

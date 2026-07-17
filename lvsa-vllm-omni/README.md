@@ -49,11 +49,31 @@ docker run --gpus all \
 
 - `lvsa>=0.1.0` (the core library)
 - `torch>=2.1.0`
-- `vllm==0.22.0` (PyPI) + `vllm-omni==0.22.0` (built from the git tag `@v0.22.0`).
-  Symmetric pairing — both are 0.22.0.
+- `vllm==0.24.0` (PyPI stable) + `vllm-omni==0.24.0rc1` (built from the git tag `@v0.24.0rc1`).
   For the older pip-installable pair (`0.18.0`/`0.18.0`), use the `release/v0.18.x` branch.
 - Optional: `flashinfer-python>=0.2` (for FlashInfer LVSA backend)
 - `flash_attn` is **not required** — torch SDPA dispatches to Flash Attention v2 internally
+
+### vLLM-Omni 0.25 line (verified compatible — 2 environment requirements)
+
+`vllm-omni==0.25.0rc1` (aligned with the vLLM 0.25 release line) is verified compatible with this plugin
+**without code changes** (registers into the attention enum, tests pass, GPU smokes incl. Ulysses SP pass).
+Two **environment** requirements apply on the 0.25 line — both are vLLM-Omni packaging issues, not plugin ones:
+
+1. **FFmpeg for `torchcodec`.** vLLM-Omni 0.25 pulls `torchcodec`, which loads FFmpeg shared libs at
+   `import vllm_omni`; without them the import fails (`libtorchcodec_core*.so` won't load). If your host has
+   no system FFmpeg, the co-installed `PyNvVideoCodec` bundles ffmpeg-7 `.so` files — put its directory on
+   `LD_LIBRARY_PATH`:
+   ```bash
+   export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/PyNvVideoCodec:$LD_LIBRARY_PATH"
+   ```
+   (Or install system/conda FFmpeg.)
+2. **Pin `flashinfer-jit-cache` to match `flashinfer`.** vLLM 0.25 ships `flashinfer==0.6.13`; a newer
+   jit-cache errors on a version mismatch. Install the matching version (or bypass the check):
+   ```bash
+   uv pip install "flashinfer-jit-cache==0.6.13" --index-url https://flashinfer.ai/whl/cu130
+   # or, to bypass: export FLASHINFER_DISABLE_VERSION_CHECK=1
+   ```
 
 ---
 
@@ -74,8 +94,8 @@ vllm serve /models/Wan2.1-T2V-1.3B-Diffusers --omni --port 8100 \
     --diffusion-attention-config '{"per_role": {"self": {"backend": "LVSA"}}}'
 ```
 
-vllm-omni 0.22 selects the attention backend per role via `AttentionConfig`
-(the `DIFFUSION_ATTENTION_BACKEND` env var was removed). This requires that
+vllm-omni 0.22 selects the attention backend per role via `AttentionConfig`.
+This requires that
 `register_lvsa_backend()` has been called before model loading — the entry
 point and Docker image handle that automatically (see
 [Backend Registration](#backend-registration)). The serve wrapper in Option 1
@@ -119,6 +139,7 @@ All LVSA parameters are set via environment variables (`LVSA_*`) or a JSON confi
 | `LVSA_EXPAND_WINDOW` | true | Expand the local window outward when it overlaps global frames (matches the standalone default); set `0` for the adaptive (non-expanded) window |
 | `LVSA_SPARSITY_SCALE` | 1.0 | Multiplier on per-query attention budget. `<1` = more sparse, `>1` = less sparse. Quality/speed knob. |
 | `LVSA_REFERENCE_LATENT_FRAMES` | 21 | Model's training-horizon latent frame count. **Set per model**: Wan=21, HunyuanVideo=33, CogVideoX=13. |
+| `LVSA_CONDITION_LATENT_FRAMES` | (empty) | V2V/I2V conditioning latent-frame indices (comma-separated, e.g. Cosmos 3's `0,1`). Forced into the sparse global set every step so re-injected reference anchors stay globally attended, independent of `LVSA_N_FIRST_FRAMES`. Empty (default) = no-op for plain T2V. |
 
 ### Backend
 
@@ -161,9 +182,7 @@ The plugin must infer `seq_len = T_lat × P + enc_tokens` from the raw token ten
 | `LVSA_WARN_FALLBACK` | true | Print one-line warnings on silent dense fallback (recommended on) |
 | `LVSA_MEM_LOG` | 0 | Per-step device memory logging — emits `[LVSA-MEM] step=N alloc=… reserved=… peak=…` once per denoising step. Device-agnostic (CUDA + Ascend NPU). Wired in all three plugin paths (`attention_impl`, `hunyuan_hook`, `wan_hook`). |
 | `LVSA_STEP_TIME_LOG` | 0 | Per-step wall-clock log — emits `[LVSA-TIME] step=N dt=…s` for the step that just completed. Same coverage as `LVSA_MEM_LOG`. |
-| `LVSA_COSMOS3_HOOK` | 0 | Install the Cosmos 3.0 LVSA hook (`cosmos3_hook.py`) at `register_lvsa_backend()`. Cosmos has no backend path — this hook is how Cosmos engages LVSA. |
-| `LVSA_DISPATCH_BACKEND` | auto | (Cosmos hook) Force the diffusers `dispatch_attention_fn` backend for the und/causal pathway (e.g. `flash`, `native`). Leave unset for diffusers' default. |
-| `LVSA_REPEAT_KV` | 0 | (Cosmos hook, ablation) Force legacy `repeat_interleave` GQA instead of native grouped-KV — 4× more KV traffic; only for debugging parity. |
+| `LVSA_COSMOS3_BACKEND` | 0 | Install the Cosmos 3.0 LVSA backend seam-swap (`cosmos3_backend.py`) at `register_lvsa_backend()` — replaces `Cosmos3CrossAttention`'s resolved attention backend (`self.attn`) with `LVSAAttentionImpl`. Engages sparse single-GPU **and under Ulysses SP** (GPU-verified 2026-07-07); the earlier forward-patch hook (`LVSA_COSMOS3_HOOK`) has been removed. |
 | `LVSA_MASK_LOG` | — | Per-step compact attention-mask dump (G=global, W=window, X=both, .=skip). Values: `1` every step, `once` first step only, `N` step N only, `N-M` inclusive range, `N,M,K` specific steps. Useful to confirm the sparsity pattern at a given denoising step. |
 | `LVSA_N_BLOCKS` | auto | Override the expected attention-block count per step. Used by `step_tracker` to detect step boundaries; auto-detected on the first step normally. |
 | `LVSA_CONFIG` | — | JSON string overriding all `LVSA_*` env vars above |
