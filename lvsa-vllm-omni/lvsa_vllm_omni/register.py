@@ -130,7 +130,16 @@ def maybe_install_cosmos3_backend():
         from lvsa_vllm_omni.cosmos3_backend import install_cosmos3_lvsa_backend
         T_lat = os.environ.get("LVSA_TOTAL_LATENT_FRAMES")
         P_env = os.environ.get("LVSA_PATCHES_PER_FRAME")
-        num_patches = int(P_env) if P_env else None
+        # LVSA_PATCHES_PER_FRAME may be a comma-separated candidate list (see
+        # config.candidate_patches_per_frame). num_patches here is diagnostic-only
+        # (echoed in the install log; the forward path re-resolves geometry), so
+        # take the first candidate and never let a parse error abort the install.
+        num_patches = None
+        if P_env:
+            try:
+                num_patches = int(P_env.split(",")[0].strip())
+            except ValueError:
+                num_patches = None
         if T_lat:
             install_cosmos3_lvsa_backend(
                 total_latent_frames=int(T_lat), num_patches=num_patches,

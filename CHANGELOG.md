@@ -46,6 +46,12 @@ All notable changes to LVSA will be documented in this file. Format: [Keep a Cha
   reads it after `__init__`, and setting it was a footgun: a future
   re-instantiation from the class would rebuild `LVSAAttentionImpl` without
   `cosmos_gen=True` and silently degrade Cosmos to dense.
+- **`register.py` tolerates a comma-separated `LVSA_PATCHES_PER_FRAME`** on the
+  Cosmos backend install path. The value is documented as an optional candidate
+  list (`config.candidate_patches_per_frame`); the bare `int()` raised on that
+  form, and the surrounding `except` aborted the whole backend install → silent
+  dense. Now takes the first candidate and never lets a parse error skip install
+  (the value is diagnostic-only; the forward path re-resolves geometry).
 
 
 ## [1.3.0] — 2026-06-16
