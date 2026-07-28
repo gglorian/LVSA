@@ -108,6 +108,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Periodic keyframe interval (video frames).",
     )
 
+    parser.add_argument(
+        "--corrected-dense",
+        action="store_true",
+        help="Dense baseline WITHOUT the stock processor's [B,1,S,S] attention mask "
+             "(mask-free HunyuanVideo15AttnProcessor2_0). A non-null mask forces SDPA off "
+             "FlashAttention and allocates O(S^2); dropping it is ~2.5x faster per attention "
+             "call and fits at long horizons where the stock masked dense OOMs. Numerically "
+             "identical to LVSA at full attention. Ignored when --lvsa is set (LVSA is already "
+             "mask-free). Single-GPU only. This is the paper's 'corrected dense' baseline.",
+    )
+
     return parser
 
 
@@ -166,10 +177,20 @@ def main() -> None:
     # ── LVSA processor installation ────────────────────────────────────────────
     lvsa_processor = None
     if args.lvsa:
+        if getattr(args, "corrected_dense", False) and rank == 0:
+            print("[attn] --corrected-dense ignored: LVSA is already mask-free")
         lvsa_processor = install_lvsa_processors(
             pipe, args, rank, world, adapter,
             sparsity_scale=args.sparsity_scale,
         )
+    elif getattr(args, "corrected_dense", False):
+        if world > 1:
+            raise ValueError("--corrected-dense is single-GPU only (no context-parallel path)")
+        from lvsa.hv_corrected_dense import install_corrected_dense
+        n_blocks = install_corrected_dense(pipe)
+        if rank == 0:
+            print(f"[attn] corrected dense: mask-free processor on {n_blocks} blocks "
+                  "(no [B,1,S,S] mask; FlashAttention-eligible, O(S) memory)")
     elif rank == 0:
         print("[attn] using standard full attention (no LVSA)")
 
